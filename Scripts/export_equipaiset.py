@@ -30,6 +30,9 @@ OVERRIDES = ROOT / "Extraction/editor/equipaiset_line_overrides.json"
 EQUIPAISET_BASE = 0x2787F28
 EQUIPAISET_STRIDE = 0x130
 EQUIPAISET_COUNT = 358
+# Table @ EQUIPAISET_BASE is really the *skill* definition table (row id == skill id),
+# and it extends past the 358 named presets. Skill ids 1..470 are valid rows.
+SKILL_TABLE_COUNT = 471
 TYPE_MANAGER_BASE_ID = 486  # EquipAiSet id N → type index N+486
 
 # Authoritative per-preset tactics list (unit init 0xDDB90 → getter 0x229B4).

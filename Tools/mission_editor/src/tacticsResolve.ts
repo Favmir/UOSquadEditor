@@ -144,7 +144,9 @@ export function tacticsForPreset(
       entry.action = base.action || sid;
       entry.skill_id = base.skill_id || 0;
       entry.skill_symbol = base.skill_symbol || "";
-      entry.skill_name = base.skill_name || "";
+      // Prefer the official catalog name over whatever was baked into the class row.
+      entry.skill_name =
+        skills.get(base.skill_id || 0)?.name || base.skill_name || "";
       entry.learn_level = base.learn_level || 1;
       entry.locked = (base.learn_level || 1) > lvl;
       entry.from_class_default = true;
@@ -167,14 +169,15 @@ export function tacticsForPreset(
 
 export function resolveMarkerHint(
   skillRef: number,
-  classLines: ClassLine[]
+  classLines: ClassLine[],
+  skills?: Map<number, SkillMeta>
 ): { skill_id: number; skill_name: string; skill_symbol: string } | null {
   if (!isClassMarker(skillRef)) return null;
   const base = classLines.find((l) => (l.action || 0) === skillRef);
   if (!base?.skill_id) return null;
   return {
     skill_id: base.skill_id,
-    skill_name: base.skill_name || "",
+    skill_name: skills?.get(base.skill_id)?.name || base.skill_name || "",
     skill_symbol: base.skill_symbol || "",
   };
 }

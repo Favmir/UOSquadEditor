@@ -29,6 +29,7 @@ from export_equipaiset import (  # noqa: E402
     EQUIPAISET_BASE,
     EQUIPAISET_COUNT,
     EQUIPAISET_STRIDE,
+    SKILL_TABLE_COUNT,
     TACTICS_SLOT_BASE,
     TACTICS_SLOT_STRIDE,
     apply_lines_to_tactics_slots,
@@ -308,6 +309,12 @@ def write_equipaiset_row(
         )
     else:
         src_slots = bytearray(TACTICS_SLOT_STRIDE)
+    if len(lines) > 8:
+        print(
+            f"WARNING: EquipAiSet {new_id} has {len(lines)} tactics lines but the "
+            f"game only reads 8; the last {len(lines) - 8} are dropped.",
+            file=sys.stderr,
+        )
     apply_lines_to_tactics_slots(src_slots, lines, N_IFS)
     add_comment(patches, f"EquipAiSet {new_id} tactics slot table")
     slot_dst = TACTICS_SLOT_BASE + new_id * TACTICS_SLOT_STRIDE
@@ -614,7 +621,7 @@ def main() -> None:
             class_words[skill_off] = skill_id
 
             # Defaults belong to the skill, not the class or unit.
-            if 0 < skill_id < EQUIPAISET_COUNT:
+            if 0 < skill_id < SKILL_TABLE_COUNT:
                 skill_row = EQUIPAISET_BASE + skill_id * EQUIPAISET_STRIDE
                 patches.append(
                     pchtxt_word(skill_row + SKILL_DEFAULT_IF0_OFF, int(line.get("if0") or 0))

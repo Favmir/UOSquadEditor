@@ -607,9 +607,17 @@ def main() -> None:
         if entry["if1"]:
             entry["if1_symbol"] = if_label(entry["if1"], r.get("if1_symbol") or "")
         if r.get("skill_id"):
-            entry["skill_id"] = int(r["skill_id"])
-            entry["skill_symbol"] = r.get("skill_symbol") or ""
-            entry["skill_name"] = r.get("skill_name") or ""
+            csid = int(r["skill_id"])
+            entry["skill_id"] = csid
+            entry["skill_symbol"] = r.get("skill_symbol") or skill_symbol_by_id.get(
+                csid, ""
+            )
+            # The CSV label is an internal/item label for some rows (e.g. id 445
+            # "Evasive Impetus" shows as "Evade", id 460 "Evade" as "Grant Evade",
+            # stubs like "装備AIアクション判定用"). Use the official catalog name.
+            entry["skill_name"] = (
+                skill_name_by_id.get(csid) or r.get("skill_name") or ""
+            )
         class_lines.setdefault(cid, []).append(entry)
 
     class_names = parse_enum(DEBUG / "_UcEnum_Class.inc", "CLASSTYPE:")

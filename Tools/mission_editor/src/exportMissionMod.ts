@@ -26,6 +26,11 @@ const SKILL_DEFAULT_IF0_OFF = 0xac;
 const SKILL_DEFAULT_IF1_OFF = 0xb0;
 const EQUIPAISET_BASE = 0x2787f28;
 const EQUIPAISET_COUNT = 358;
+/**
+ * The table at EQUIPAISET_BASE is the skill-definition table (row id == skill id)
+ * and is larger than the 358 named presets. Skill ids 1..470 have a default-IF row.
+ */
+export const SKILL_TABLE_COUNT = 471;
 const EQUIPAISET_STRIDE = 0x130;
 const TACTICS_SLOT_BASE = 0x270af48;
 const TACTICS_SLOT_STRIDE = 0x48;
@@ -127,7 +132,12 @@ export type ExportCatalog = {
   equipai_if?: { id: number; name?: string; symbol?: string }[];
   items?: { id: number; name?: string; symbol?: string }[];
   class_tactics?: { class_id: number; class_symbol?: string }[];
-  equipaiset_presets?: { id: number; symbol?: string; usage?: number }[];
+  equipaiset_presets?: {
+    id: number;
+    symbol?: string;
+    usage?: number;
+    references?: { context?: string; quest_symbol?: string }[];
+  }[];
 };
 
 function pchtxtWord(va: number, value: number): string {
@@ -185,7 +195,27 @@ function applyLines(row: Uint8Array, lines: ExportLine[]) {
   }
 }
 
-function writeTacticsRow(patches: string[], id: number, lines: ExportLine[]) {
+function writeTacticsRow(
+  patches: string[],
+  id: number,
+  lines: ExportLine[],
+  notes?: string[]
+) {
+  if (notes) {
+    if (lines.length > TACTICS_SLOT_COUNT) {
+      notes.push(
+        `WARNING: EquipAiSet ${id} has ${lines.length} tactics lines but the game ` +
+          `only reads ${TACTICS_SLOT_COUNT}; the last ${lines.length - TACTICS_SLOT_COUNT} ` +
+          `line(s) are dropped (passives at the end go first).`
+      );
+    }
+    if (!lines.some((l) => Number(l.skill_id || 0) || Number(l.action || 0) >= 3)) {
+      notes.push(
+        `WARNING: EquipAiSet ${id} is written with no usable tactics; any unit ` +
+          `pointing at it will have NO tactics in battle.`
+      );
+    }
+  }
   const row = new Uint8Array(TACTICS_SLOT_STRIDE);
   applyLines(row, lines);
   const dv = new DataView(row.buffer);
@@ -341,7 +371,7 @@ export function buildMissionMod(
     allocatedIds.add(newId);
     eaUsed.set(newId, (eaUsed.get(newId) || 0) + 1);
     const symbol = String(create.symbol || key);
-    writeTacticsRow(patches, newId, lines);
+    writeTacticsRow(patches, newId, lines, notes);
     tacticsOverrides[String(newId)] = lines;
     eaMap.set(key, newId);
     if (create.temp_id != null) eaMap.set(String(create.temp_id), newId);
@@ -361,7 +391,7 @@ export function buildMissionMod(
     const unitLabel =
       unitLabels.get(`${Number(alloc.unitset_id || 0)}:${Number(alloc.slot || 0)}`) ||
       `UnitSet ${alloc.unitset_id ?? "?"} slot ${alloc.slot ?? "?"}`;
-    writeTacticsRow(patches, newId, lines);
+    writeTacticsRow(patches, newId, lines, notes);
     tacticsOverrides[String(newId)] = lines;
     const change = `Allocated private EquipAiSet ${src} -> ${newId} for ${unitLabel} (${lines.length} tactics slots)`;
     notes.push(change);
@@ -452,7 +482,7 @@ export function buildMissionMod(
       }
       classWords[levelOff] = learnLevel;
       classWords[skillOff] = skillId;
-      if (skillId > 0 && skillId < EQUIPAISET_COUNT) {
+      if (skillId > 0 && skillId < SKILL_TABLE_COUNT) {
         const skillRow = EQUIPAISET_BASE + skillId * EQUIPAISET_STRIDE;
         patches.push(
           pchtxtWord(skillRow + SKILL_DEFAULT_IF0_OFF, Number(line.if0 || 0))
@@ -571,8 +601,27 @@ export function buildMissionMod(
     }
     if (allocatedIds.has(eid)) continue;
     const normalized = normalizeLines(rawLines);
-    writeTacticsRow(patches, eid, normalized);
+    writeTacticsRow(patches, eid, normalized, notes);
     const presetName = presetLabels.get(eid) || "EquipAiSet";
+    {
+      // A preset only matters where a UnitSet points at it. Many vanilla presets
+      // (e.g. CH_ELFFENCER_AT) are only used by Overworld / Arena / OFFLINE sets, so
+      // editing them has no visible effect in story missions.
+      const refs = (catalog.equipaiset_presets || []).find((p) => p.id === eid)
+        ?.references;
+      const nonMission = new Set(["Overworld", "Arena", "OFFLINE", "Test"]);
+      if (
+        refs &&
+        refs.length > 0 &&
+        refs.every((r) => !r.quest_symbol || nonMission.has(String(r.context || "")))
+      ) {
+        const where = [...new Set(refs.map((r) => String(r.context || "?")))].join(", ");
+        notes.push(
+          `NOTE: preset ${presetName} (${eid}) is only referenced by ${where} UnitSets; ` +
+            `no story-mission unit uses it. Assign it to a mission unit to see it in battle.`
+        );
+      }
+    }
     const change = `Patched preset ${presetName} (${eid}): ${normalized.length} tactics slots`;
     notes.push(change);
     changes.push(change);

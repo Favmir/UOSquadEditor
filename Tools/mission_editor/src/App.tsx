@@ -14,7 +14,7 @@ import {
   type ItemSkill,
   type ResolveLine,
 } from "./tacticsResolve";
-import { buildMissionMod } from "./exportMissionMod";
+import { buildMissionMod, SKILL_TABLE_COUNT } from "./exportMissionMod";
 import { overlayPchtxtOnCatalog } from "./resolvePchtxt";
 import { unzipTextFiles, zipStore } from "./zipStore";
 
@@ -915,6 +915,20 @@ function App() {
   const skillsById = useMemo(() => {
     const m = new Map<number, CatalogEntry>();
     for (const sk of doc?.skills ?? []) m.set(sk.id, sk);
+    return m;
+  }, [doc]);
+
+  /** Vanilla per-skill default IF0/IF1, taken from the unmodified class tables. */
+  const vanillaSkillIfs = useMemo(() => {
+    const m = new Map<number, { if0: number; if1: number }>();
+    for (const c of doc?.class_tactics ?? []) {
+      for (const ln of c.lines) {
+        const sid = Number(ln.skill_id || 0);
+        if (sid > 0 && !m.has(sid)) {
+          m.set(sid, { if0: Number(ln.if0 || 0), if1: Number(ln.if1 || 0) });
+        }
+      }
+    }
     return m;
   }, [doc]);
 
@@ -2139,6 +2153,7 @@ function App() {
                 }
                 skillOptions={skillOptions}
                 skillsById={skillsById}
+                vanillaSkillIfs={vanillaSkillIfs}
                 ifOptions={ifOptions}
                 onChange={(lines) => commitClassTactics(selectedClass, lines)}
               />
@@ -2423,6 +2438,7 @@ function ClassTacticsPanel({
   editedLines,
   skillOptions,
   skillsById,
+  vanillaSkillIfs,
   ifOptions,
   onChange,
 }: {
@@ -2430,6 +2446,7 @@ function ClassTacticsPanel({
   editedLines?: Line[];
   skillOptions: ComboboxOption[];
   skillsById: Map<number, CatalogEntry>;
+  vanillaSkillIfs: Map<number, { if0: number; if1: number }>;
   ifOptions: ComboboxOption[];
   onChange: (lines: Line[]) => void;
 }) {
@@ -2485,8 +2502,17 @@ function ClassTacticsPanel({
                       skill_id: id || undefined,
                       skill_symbol: skill?.symbol || "",
                       skill_name: skill?.name || "",
-                      if0: id === line?.skill_id ? line?.if0 || 0 : 0,
-                      if1: id === line?.skill_id ? line?.if1 || 0 : 0,
+                      // Keep the current IFs for the same skill; otherwise start from
+                      // the picked skill's vanilla defaults (IFs live on the skill row,
+                      // so writing 0/0 would wipe them for every user of that skill).
+                      if0:
+                        id === line?.skill_id
+                          ? line?.if0 || 0
+                          : vanillaSkillIfs.get(id)?.if0 ?? 0,
+                      if1:
+                        id === line?.skill_id
+                          ? line?.if1 || 0
+                          : vanillaSkillIfs.get(id)?.if1 ?? 0,
                     });
                   }}
                 />
@@ -2508,7 +2534,7 @@ function ClassTacticsPanel({
               </label>
               <label>
                 Default IF0
-                {line?.skill_id && line.skill_id < 358 ? (
+                {line?.skill_id && line.skill_id < SKILL_TABLE_COUNT ? (
                   <SearchableCombobox
                     options={ifOptions}
                     value={line.if0 || 0}
@@ -2527,7 +2553,7 @@ function ClassTacticsPanel({
               </label>
               <label>
                 Default IF1
-                {line?.skill_id && line.skill_id < 358 ? (
+                {line?.skill_id && line.skill_id < SKILL_TABLE_COUNT ? (
                   <SearchableCombobox
                     options={ifOptions}
                     value={line.if1 || 0}
@@ -2866,7 +2892,7 @@ function PresetPanel({
         const marker = isClassMarker(sid);
         const hint =
           marker && previewClassLines.length
-            ? resolveMarkerHint(sid, previewClassLines)
+            ? resolveMarkerHint(sid, previewClassLines, skillMap)
             : marker
               ? {
                   skill_name: line.resolved_skill_name || "",
