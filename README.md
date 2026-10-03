@@ -1,3 +1,4 @@
+<<<<<<< Updated upstream
 I made this fork to create a mod called "[Smart Enemies](https://gamebanana.com/mods/718970)".
 
 A few differences from the original tool:
@@ -8,12 +9,16 @@ A few differences from the original tool:
 5. Fixes generated default unit equipments disappearing when you change their position.
 6. Added 'Misc' category to regions list (for 'gates' that block you from going to the next area)
 7. Added warnings for having too many EquipAiSets or putting a wrong skillset on a unit.
+8. Now can tell a unit's equipment tier with colors labels
+9. Lists are divided into 4 columns to make them fit in one screen.
 
 
 To run this, just download the whole thing as a ZIP, extract the .zip file somewhere, then run the **run-editor.bat** file.
 This will automatically bring up a webpage you can use to create your own mod.
 
 
+=======
+>>>>>>> Stashed changes
 # UO Squad Editor
 
 Unofficial fan tools for Unicorn Overlord (Ryujinx, US v1.0.5).

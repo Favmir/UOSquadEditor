@@ -1,5 +1,7 @@
 /** Browser-side Ryujinx .pchtxt export (same addresses as Scripts/export_mission_mod.py). */
 
+import { findPresetProblems } from "./presetCheck";
+
 const NSOBID = "C841FFE2717FF03A13990480C51DA73F091C04FA";
 const UNITSET_BASE = 0x28120b8;
 const UNITSET_STRIDE = 0x88;
@@ -135,18 +137,25 @@ export type ExportCatalog = {
       slots?: {
         slot?: number;
         charaset_id?: number;
+        class_id?: number;
         chara_name?: string;
         charaset_symbol?: string;
       }[];
     }[];
   }[];
+  charasets?: { id: number; class_id?: number }[];
   skills?: { id: number; name?: string; symbol?: string }[];
   equipai_if?: { id: number; name?: string; symbol?: string }[];
   items?: { id: number; name?: string; symbol?: string }[];
-  class_tactics?: { class_id: number; class_symbol?: string }[];
+  class_tactics?: {
+    class_id: number;
+    class_symbol?: string;
+    lines?: { action?: number; skill_id?: number }[];
+  }[];
   equipaiset_presets?: {
     id: number;
     symbol?: string;
+    lines?: ExportLine[];
     usage?: number;
     references?: { context?: string; quest_symbol?: string }[];
   }[];
@@ -337,6 +346,22 @@ export function buildMissionMod(
   for (const p of catalog.equipaiset_presets || []) {
     if (p.id && p.usage) eaUsed.set(p.id, p.usage);
   }
+
+  // For the freeze check: which class a CharaSet has, and that class's skill slots
+  // (with pending class-default edits applied).
+  const charaClass = new Map<number, number>();
+  for (const m of catalog.missions || [])
+    for (const sq of m.squads || [])
+      for (const sl of sq.slots || [])
+        if (sl.charaset_id && sl.class_id) charaClass.set(Number(sl.charaset_id), Number(sl.class_id));
+  for (const c of catalog.charasets || [])
+    if (c.class_id) charaClass.set(c.id, c.class_id);
+  const classSlotLines = new Map<number, { action?: number; skill_id?: number }[]>();
+  for (const c of catalog.class_tactics || []) classSlotLines.set(c.class_id, c.lines || []);
+  for (const ce of edits.class_tactics || [])
+    classSlotLines.set(Number(ce.class_id), ce.lines || []);
+  const presetBodies = new Map<number, ExportLine[]>();
+  for (const p of catalog.equipaiset_presets || []) presetBodies.set(p.id, p.lines || []);
 
   const patches: string[] = [];
   const notes: string[] = [];
@@ -693,6 +718,30 @@ export function buildMissionMod(
         eid = 0;
       }
       const flags = Number(sl.flags || 0);
+      if (eid > 0 && cid > 0) {
+        // A preset that points at a class slot this unit's class does not have
+        // makes the game freeze when the unit tries to use that skill.
+        const classId = charaClass.get(cid) || charaClass.get(Number(sl.charaset_id)) || 0;
+        const presetLines = tacticsOverrides[String(eid)] ?? presetBodies.get(eid);
+        if (classId && presetLines?.length) {
+          const className = classLabels.get(classId) || `class ${classId}`;
+          const bad = findPresetProblems({
+            presetLines,
+            classLines: classSlotLines.get(classId) || [],
+            className,
+            checkExplicit: false,
+          });
+          if (bad.length) {
+            const who = unitLabels.get(`${uid}:${si}`) || `UnitSet ${uid} slot ${si}`;
+            const msg =
+              `WARNING: FREEZE RISK: ${who} (${className}) uses preset ` +
+              `${presetLabels.get(eid) || "EquipAiSet"} (${eid}) which needs: ` +
+              [...new Set(bad.map((b) => b.message.replace(/^Line \d+: /, "")))].join(" ");
+            notes.push(msg);
+            changes.push(msg);
+          }
+        }
+      }
       patches.push(pchtxtWord(slotOff + 0x0, cid));
       patches.push(pchtxtWord(slotOff + 0x4, eid));
       patches.push(pchtxtWord(slotOff + 0x8, flags));

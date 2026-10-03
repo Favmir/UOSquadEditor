@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import "./App.css";
 import {
   SearchableCombobox,
@@ -20,11 +20,17 @@ import {
 } from "./tacticsResolve";
 import { buildMissionMod, SKILL_TABLE_COUNT } from "./exportMissionMod";
 import { dropPresetsFromEdits } from "./presetEdits";
+import { findPresetProblems, learnGearGrantedSkills } from "./presetCheck";
 import {
-  resolveDefaultItem,
-  resolveEquipParam,
+  GEAR_KIND_LABEL,
+  gearInfoOf,
+  previewSeatGear,
+  resolveSeatTier,
+  topGearKind,
   TIER_NAMES,
   type EquipTables,
+  type GearBand,
+  type GearKind,
 } from "./defaultEquip";
 import { overlayPchtxtOnCatalog } from "./resolvePchtxt";
 import { unzipTextFiles, zipStore } from "./zipStore";
@@ -413,7 +419,7 @@ function FinalTacticsTable({
                   line.locked ? "locked" : "",
                   isMarker ? "class slot (= default)" : "",
                   explicit ? "explicit" : "",
-                  missing ? "inert — unit lacks this skill" : "",
+                  missing ? "unit lacks this skill — can freeze the game" : "",
                 ]
                   .filter(Boolean)
                   .join(" · ") || "—"}
@@ -585,7 +591,175 @@ function refreshEditsSkillNames(
   };
 }
 
+type SeatEdit = {
+  equipaiset_id: number;
+  charaset_id: number;
+  flags: number;
+  equipaiset_alloc_key?: string;
+};
+
+/**
+ * A squad with pending edits applied to its seats (CharaSet swaps, preset changes,
+ * gear edits). Unedited seats keep their identity so memoized children don't reset.
+ */
+function overlaySquad(
+  rawSquad: Squad,
+  unitSlotEdits: Map<string, SeatEdit>,
+  gearEditsByCharaset: Map<number, Gear[]>,
+  presetSymbolById: Map<number, string>,
+  charasetById: Map<number, CharasetCatalogEntry>
+): Squad {
+    const baseBySlot = new Map(rawSquad.slots.map((s) => [s.slot, s]));
+    const slots: Slot[] = [];
+    for (let i = 0; i < 6; i++) {
+      const base = baseBySlot.get(i);
+      const e = unitSlotEdits.get(`${rawSquad.unitset_id}:${i}`);
+      if (e) {
+        if (!e.charaset_id) {
+          slots.push(emptySlot(i));
+          continue;
+        }
+        const catalog = charasetById.get(e.charaset_id);
+        const fromBase = base && base.charaset_id === e.charaset_id;
+        const eid = e.equipaiset_id;
+        slots.push({
+          slot: i,
+          charaset_id: e.charaset_id,
+          charaset_symbol: fromBase
+            ? base.charaset_symbol
+            : catalog?.symbol || "",
+          chara_name: fromBase ? base.chara_name || "" : catalog?.name || "",
+          class_id: fromBase ? base.class_id : catalog?.class_id || 0,
+          class_symbol: fromBase
+            ? base.class_symbol
+            : catalog?.class_symbol || "",
+          flags: e.flags,
+          equipaiset_id: eid,
+          equipaiset_symbol:
+            eid === 0
+              ? ""
+              : presetSymbolById.get(eid) ||
+                (fromBase ? base.equipaiset_symbol : ""),
+          gear:
+            gearEditsByCharaset.get(e.charaset_id) ??
+            (fromBase ? base.gear : catalog?.gear ?? emptyGear()),
+          tactics_lines: fromBase ? base.tactics_lines : [],
+          equip_param: fromBase ? base.equip_param : undefined,
+          equip_param_name: fromBase ? base.equip_param_name : undefined,
+          chara_param_override: fromBase
+            ? base.chara_param_override
+            : undefined,
+        });
+        continue;
+      }
+      if (base) {
+        const gear = gearEditsByCharaset.get(base.charaset_id) ?? base.gear;
+        slots.push(gear === base.gear ? base : { ...base, gear });
+      } else {
+        slots.push(emptySlot(i));
+      }
+    }
+  return { ...rawSquad, slots };
+}
+
+type SeatKind = {
+  slot: number;
+  kind: GearKind;
+  tier: number;
+  band: GearBand;
+  /** slots with an item that is not default equipment */
+  explicit: number;
+  /** slots filled from the default band */
+  defaults: number;
+};
+
+/** Short text describing a seat's gear for tooltips. */
+function seatKindText(k: SeatKind): string {
+  const band = `${GEAR_KIND_LABEL[k.band]} band`;
+  if (k.kind === "custom") {
+    return (
+      `Custom gear: ${k.explicit} manually placed item${k.explicit === 1 ? "" : "s"}` +
+      (k.defaults ? `, ${k.defaults} from defaults (${band})` : "")
+    );
+  }
+  if (k.kind === "none") return "No gear";
+  return `${GEAR_KIND_LABEL[k.kind]} default gear`;
+}
+
+/** Color-coding info for every occupied seat of an (edit-overlaid) squad. */
+function squadGearKinds(
+  sq: Squad,
+  level: number,
+  tables: EquipTables,
+  overrideById: Map<number, number>
+): SeatKind[] {
+  return sq.slots
+    .filter((s) => s.charaset_id > 0)
+    .map((s) => {
+      const tier = resolveSeatTier({
+        bakedTier: s.equip_param,
+        slot: s.slot,
+        charasetId: s.charaset_id,
+        seats: sq.slots,
+        exptype: sq.exptype,
+        paramset: sq.paramset,
+        overrideById,
+      });
+      const gear = previewSeatGear(s.gear, tables, s.class_id, tier, level, s.charaset_id);
+      const info = gearInfoOf(gear, tier);
+      return {
+        slot: s.slot,
+        kind: info.kind,
+        tier,
+        band: info.band,
+        explicit: info.explicitCount,
+        defaults: info.defaultCount,
+      };
+    })
+    .sort((a, b) => a.slot - b.slot);
+}
+
+const GEAR_KINDS: GearKind[] = ["default", "normal", "power", "boss", "custom"];
+
+function GearLegend() {
+  return (
+    <div
+      className="gear-legend"
+      title="Colors show which default-gear band fills a unit's empty slots (Default gear tab). Purple = at least one item is manually placed instead of default equipment, so the unit is flagged as important."
+    >
+      <span className="gear-legend-title">Gear:</span>
+      {GEAR_KINDS.map((k) => (
+        <span key={k} className="gear-legend-item">
+          <i className={`gear-dot gear-${k}`} />
+          {k === "custom" ? "★ Custom (manually placed item)" : GEAR_KIND_LABEL[k]}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+const LIST_COLS_KEY = "mission_editor.listCols";
+
+/** Let long identifiers wrap after underscores instead of in the middle of a word. */
+const breakable = (text: string): string => text.replace(/_/g, "_\u200b");
+
 function App() {
+  /** How many columns the long lists (missions, classes, presets, …) use. */
+  const [listCols, setListCols] = useState<number>(() => {
+    try {
+      const v = Number(window.localStorage.getItem(LIST_COLS_KEY));
+      return v >= 1 && v <= 4 ? v : 4;
+    } catch {
+      return 4;
+    }
+  });
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(LIST_COLS_KEY, String(listCols));
+    } catch {
+      /* storage unavailable: the choice just won't persist */
+    }
+  }, [listCols]);
   const [view, setView] = useState<
     "missions" | "classes" | "presets" | "equiptypes" | "skills"
   >("missions");
@@ -1055,66 +1229,20 @@ function App() {
   // Overlay pending edits onto the squad's slots so assignments/gear persist when
   // switching tabs. Memoized so unedited slots keep a stable identity (otherwise
   // UnitPanel would reset its local state every render).
-  const squad = useMemo(() => {
-    if (!rawSquad) return null;
-    const baseBySlot = new Map(rawSquad.slots.map((s) => [s.slot, s]));
-    const slots: Slot[] = [];
-    for (let i = 0; i < 6; i++) {
-      const base = baseBySlot.get(i);
-      const e = unitSlotEdits.get(`${rawSquad.unitset_id}:${i}`);
-      if (e) {
-        if (!e.charaset_id) {
-          slots.push(emptySlot(i));
-          continue;
-        }
-        const catalog = charasetById.get(e.charaset_id);
-        const fromBase = base && base.charaset_id === e.charaset_id;
-        const eid = e.equipaiset_id;
-        slots.push({
-          slot: i,
-          charaset_id: e.charaset_id,
-          charaset_symbol: fromBase
-            ? base.charaset_symbol
-            : catalog?.symbol || "",
-          chara_name: fromBase ? base.chara_name || "" : catalog?.name || "",
-          class_id: fromBase ? base.class_id : catalog?.class_id || 0,
-          class_symbol: fromBase
-            ? base.class_symbol
-            : catalog?.class_symbol || "",
-          flags: e.flags,
-          equipaiset_id: eid,
-          equipaiset_symbol:
-            eid === 0
-              ? ""
-              : presetSymbolById.get(eid) ||
-                (fromBase ? base.equipaiset_symbol : ""),
-          gear:
-            gearEditsByCharaset.get(e.charaset_id) ??
-            (fromBase ? base.gear : catalog?.gear ?? emptyGear()),
-          tactics_lines: fromBase ? base.tactics_lines : [],
-          equip_param: fromBase ? base.equip_param : undefined,
-          equip_param_name: fromBase ? base.equip_param_name : undefined,
-          chara_param_override: fromBase
-            ? base.chara_param_override
-            : undefined,
-        });
-        continue;
-      }
-      if (base) {
-        const gear = gearEditsByCharaset.get(base.charaset_id) ?? base.gear;
-        slots.push(gear === base.gear ? base : { ...base, gear });
-      } else {
-        slots.push(emptySlot(i));
-      }
-    }
-    return { ...rawSquad, slots };
-  }, [
-    rawSquad,
-    unitSlotEdits,
-    gearEditsByCharaset,
-    presetSymbolById,
-    charasetById,
-  ]);
+  const squad = useMemo(
+    () =>
+      rawSquad
+        ? overlaySquad(
+            rawSquad,
+            unitSlotEdits,
+            gearEditsByCharaset,
+            presetSymbolById,
+            charasetById
+          )
+        : null,
+    [rawSquad, unitSlotEdits, gearEditsByCharaset, presetSymbolById, charasetById]
+  );
+
   const slot =
     squad?.slots.find((s) => s.slot === slotIdx) ??
     squad?.slots.find((s) => s.charaset_id > 0) ??
@@ -1652,6 +1780,33 @@ function App() {
     return m;
   }, [doc]);
 
+  /** Per-squad default-gear kinds for the squad list (edits applied). */
+  const squadKinds = useMemo(() => {
+    const out = new Map<number, SeatKind[]>();
+    if (!mission) return out;
+    const level = Number(mission.enemy_level) || 1;
+    for (const sq of mission.squads) {
+      out.set(
+        sq.unitset_id,
+        squadGearKinds(
+          overlaySquad(sq, unitSlotEdits, gearEditsByCharaset, presetSymbolById, charasetById),
+          level,
+          equipTables,
+          charaOverrideById
+        )
+      );
+    }
+    return out;
+  }, [
+    mission,
+    unitSlotEdits,
+    gearEditsByCharaset,
+    presetSymbolById,
+    charasetById,
+    equipTables,
+    charaOverrideById,
+  ]);
+
   /**
    * Vanilla default IFs per skill + which equipment grants each skill.
    * Sources: class default rows, doc.item_skills (after a rebuild), and the
@@ -1689,6 +1844,32 @@ function App() {
         for (const sl of sq.slots) scan(sl.tactics_lines);
     return { defaults, itemsBySkill };
   }, [doc]);
+
+  const gearSkillHint = useMemo(() => {
+    const skillIds = new Set<number>([...skillDefaultInfo.itemsBySkill.keys()]);
+    // The item -> skill table is partial, so also learn from the base game: an
+    // explicit skill in a preset on a unit whose class lacks it must come from gear.
+    if (doc) {
+      const presetBody = new Map<number, Line[]>(
+        (doc.equipaiset_presets ?? []).map((p): [number, Line[]] => [p.id, p.lines])
+      );
+      const classBody = new Map<number, Line[]>(
+        (doc.class_tactics ?? []).map((c): [number, Line[]] => [c.class_id, c.lines])
+      );
+      const entries: { classLines: Line[]; presetLines: Line[] }[] = [];
+      for (const m of doc.missions)
+        for (const sq of m.squads)
+          for (const sl of sq.slots) {
+            const body = sl.charaset_id && sl.equipaiset_id ? presetBody.get(sl.equipaiset_id) : undefined;
+            if (body) entries.push({ classLines: classBody.get(sl.class_id) ?? [], presetLines: body });
+          }
+      for (const id of learnGearGrantedSkills(entries)) skillIds.add(id);
+    }
+    return {
+      complete: !!doc?.item_skills?.length || !!liveItemSkills,
+      skillIds,
+    };
+  }, [doc, liveItemSkills, skillDefaultInfo]);
 
   /** EquipAiSet row budget. The game's table has a fixed number of rows. */
   const presetBudget = useMemo(() => {
@@ -1985,8 +2166,12 @@ function App() {
       a.download = `${modName}.zip`;
       a.click();
       URL.revokeObjectURL(a.href);
+      const freezeRisks = built.notes.filter((n) => n.includes("FREEZE RISK")).length;
       setExportMsg(
-        `Downloaded ${modName}.zip (${built.patchCount} patches). Unzip and copy the folder into Ryujinx → Open Mods Directory.`
+        `Downloaded ${modName}.zip (${built.patchCount} patches). Unzip and copy the folder into Ryujinx → Open Mods Directory.` +
+          (freezeRisks
+            ? ` ⛔ ${freezeRisks} unit(s) use a tactics preset needing skills their class lacks — the game can freeze. See CHANGELOG.txt (FREEZE RISK).`
+            : "")
       );
     } catch (e) {
       setExportMsg(String(e));
@@ -2226,7 +2411,16 @@ function App() {
     null;
 
   return (
-    <div className="app">
+    <div
+      className="app"
+      style={
+        {
+          "--list-cols": listCols,
+          // two-line items (squads) get at most 2 columns so they stay readable
+          "--list-cols-narrow": Math.min(listCols, 2),
+        } as CSSProperties
+      }
+    >
       <header className="header">
         <div>
           <p className="hub-back">
@@ -2339,6 +2533,20 @@ function App() {
         >
           Skill conditions
         </button>
+        <span className="list-cols-control" title="Columns used by the long lists">
+          List columns
+          {[1, 2, 3, 4].map((n) => (
+            <button
+              key={n}
+              type="button"
+              className={listCols === n ? "active" : ""}
+              onClick={() => setListCols(n)}
+              aria-pressed={listCols === n}
+            >
+              {n}
+            </button>
+          ))}
+        </span>
       </nav>
 
       {view === "missions" ? <div className="layout">
@@ -2381,6 +2589,7 @@ function App() {
                 <button
                   type="button"
                   className={m.quest_id === missionId ? "active" : ""}
+                  title={`${m.stage_name || m.quest_symbol} · ${missionRegion(m)} · Lv ${m.enemy_level || "?"}`}
                   onClick={() => {
                     setMissionId(m.quest_id);
                     setPresetMissionId(m.quest_id);
@@ -2389,8 +2598,7 @@ function App() {
                 >
                   <strong>{m.stage_name || m.quest_symbol}</strong>
                   <span>
-                    {missionRegion(m)} · Lv {m.enemy_level || "?"} · {m.squads.length}{" "}
-                    squads
+                    {missionRegion(m)} · Lv {m.enemy_level || "?"} · {m.squads.length} sq
                   </span>
                 </button>
               </li>
@@ -2427,26 +2635,51 @@ function App() {
               </select>
             </div>
           </div>
-          <ul className="list">
-            {squads.map((s) => (
-              <li key={s.unitset_id}>
-                <button
-                  type="button"
-                  className={
-                    s.unitset_id === (squad?.unitset_id ?? -1) ? "active" : ""
-                  }
-                  onClick={() => setSquadId(s.unitset_id)}
-                >
-                  <strong>{s.unitset_symbol.replace("UC_UNITSET_", "")}</strong>
-                  <span>
-                    {s.side}
-                    {s.paramset_name ? ` · ${s.paramset_name}` : ""}
-                    {" · "}
-                    {s.slots.filter((sl) => sl.charaset_id > 0).length} units
-                  </span>
-                </button>
-              </li>
-            ))}
+          <GearLegend />
+          <ul className="list list-narrow">
+            {squads.map((s) => {
+              const kinds: SeatKind[] = squadKinds.get(s.unitset_id) ?? [];
+              const top = topGearKind(kinds.map((k) => k.kind));
+              const summary = (["custom", ...GEAR_KINDS.filter((k) => k !== "custom"), "none"] as GearKind[])
+                .map((k) => [k, kinds.filter((x) => x.kind === k).length] as const)
+                .filter(([, n]) => n > 0)
+                .map(([k, n]) => `${n} ${GEAR_KIND_LABEL[k]}`)
+                .join(", ");
+              return (
+                <li key={s.unitset_id}>
+                  <button
+                    type="button"
+                    className={[
+                      s.unitset_id === (squad?.unitset_id ?? -1) ? "active" : "",
+                      top ? `gear-${top}` : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" ")}
+                    title={summary ? `Gear: ${summary}` : undefined}
+                    onClick={() => setSquadId(s.unitset_id)}
+                  >
+                    <strong>{breakable(s.unitset_symbol.replace("UC_UNITSET_", ""))}</strong>
+                    <span>
+                      {s.side}
+                      {s.paramset_name ? ` · ${s.paramset_name}` : ""}
+                      {" · "}
+                      {s.slots.filter((sl) => sl.charaset_id > 0).length} units
+                    </span>
+                    {kinds.length > 0 && (
+                      <span className="gear-dots">
+                        {kinds.map((k) => (
+                          <i
+                            key={k.slot}
+                            className={`gear-dot gear-${k.kind}`}
+                            title={`${formationLabel(k.slot)}: ${seatKindText(k)}`}
+                          />
+                        ))}
+                      </span>
+                    )}
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         </section>
 
@@ -2475,6 +2708,8 @@ function App() {
               itemSkills={itemSkillMap}
               equipTables={equipTables}
               charaOverrideById={charaOverrideById}
+              gearSkillHint={gearSkillHint}
+              seatKinds={squadKinds.get(squad.unitset_id) ?? []}
               ifMap={ifMap}
               skillMap={skillMap}
               sharedPreset={
@@ -2520,9 +2755,10 @@ function App() {
                   <button
                     type="button"
                     className={entry.class_id === selectedClass?.class_id ? "active" : ""}
+                    title={`${entry.class_symbol} (class ${entry.class_id}, ${entry.lines.length} skills)`}
                     onClick={() => setClassId(entry.class_id)}
                   >
-                    <strong>{entry.class_symbol}</strong>
+                    <strong>{breakable(entry.class_symbol)}</strong>
                     <span>Class {entry.class_id} · {entry.lines.length} skills</span>
                   </button>
                 </li>
@@ -2644,7 +2880,7 @@ function App() {
                   <summary>
                     Per-unit tactics copies ({edits.equipaiset_allocations.length})
                   </summary>
-                  <ul className="list">
+                  <ul className="list list-single">
                     {edits.equipaiset_allocations.map((a) => (
                       <li key={a.key}>
                         <span>
@@ -2725,9 +2961,16 @@ function App() {
                     <button
                       type="button"
                       className={entry.id === selectedPreset?.id ? "active" : ""}
+                      title={[
+                        entry.symbol || `EquipAiSet ${entry.id}`,
+                        entry.id < 0 ? "New (unexported)" : `ID ${entry.id} · ${entry.usage} refs`,
+                        missionHit,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
                       onClick={() => setPresetId(entry.id)}
                     >
-                      <strong>{entry.symbol || `EquipAiSet ${entry.id}`}</strong>
+                      <strong>{breakable(entry.symbol || `EquipAiSet ${entry.id}`)}</strong>
                       <span>
                         {entry.id < 0
                           ? "New (unexported)"
@@ -2854,10 +3097,11 @@ function App() {
                       className={
                         entry.id === selectedEquiptype?.id ? "active" : ""
                       }
+                      title={`${entry.symbol} (#${entry.id})`}
                       onClick={() => setEquiptypeId(entry.id)}
                     >
                       <strong>
-                        {entry.symbol}
+                        {breakable(entry.symbol)}
                         {dirty ? " *" : ""}
                       </strong>
                       <span>#{entry.id}</span>
@@ -2920,15 +3164,22 @@ function EquiptypeItemsPanel({
       <p className="hint">
         Equiptype #{entry.id}. Empty CharaSet gear slots resolve through this
         row when class base + tier×11 lands here.
-        {entry.symbol.startsWith("DEFAULT_")
-          ? " DEFAULT_* is only ZAKO / clamped-DEFAULT — most mission enemies use the matching NORMAL_* row instead."
-          : entry.symbol.startsWith("ENEMY_")
-            ? " ENEMY_* is unused: ZAKO clamps to DEFAULT_*."
-            : entry.symbol.startsWith("NORMAL_")
-              ? " NORMAL_* is the band most mission / fodder enemies use."
-              : ""}{" "}
-        Mission unit gear preview is baked at data build time — re-sync after
-        export if you need updated previews.
+        {entry.id === 22 || entry.id === 33 || entry.id === 44
+          ? " A class's NONE slot lands here at NORMAL (row 22), POWER (row 33) or BOSS (row 44) tier, so an item here is an extra accessory for every class that has a NONE slot at that tier."
+          : entry.symbol.startsWith("DEFAULT_")
+            ? " DEFAULT_* is only ZAKO / clamped-DEFAULT — most mission enemies use the matching NORMAL_* row instead."
+            : entry.symbol.startsWith("ENEMY_")
+              ? " ENEMY_* is unused: ZAKO clamps to DEFAULT_*."
+              : entry.symbol.startsWith("NORMAL_")
+                ? " NORMAL_* is the band most mission / fodder enemies use."
+                : entry.symbol.startsWith("POWER_")
+                  ? " POWER_* is the band for elite units and for generic companions of boss characters."
+                  : entry.symbol.startsWith("BOSS_")
+                    ? " BOSS_* is the band for boss-tier units."
+                    : ""}{" "}
+        Unit previews in Mission Units update live from your edits here. Items
+        named in a unit's CharaSet are never replaced; only empty slots use this
+        table. Edits apply to every unit that resolves to this row, on any side.
       </p>
       <div className="equiptype-cols">
         {labels.map((label, i) => (
@@ -3086,6 +3337,7 @@ function SkillConditionsView({
               <button
                 type="button"
                 className={s.id === selected?.id ? "active" : ""}
+                title={`${s.name || s.symbol} (#${s.id}, ${s.kind})`}
                 onClick={() => setSelectedId(s.id)}
               >
                 <strong>
@@ -3787,11 +4039,13 @@ function FormationGrid({
   squad,
   selectedSlot,
   pickSlot,
+  seatKinds,
   onSelect,
 }: {
   squad: Squad;
   selectedSlot: number;
   pickSlot: number | null;
+  seatKinds: SeatKind[];
   onSelect: (slot: number) => void;
 }) {
   return (
@@ -3803,6 +4057,7 @@ function FormationGrid({
           seat).
         </span>
       </div>
+      <GearLegend />
       <div className="formation-grid">
         <div className="formation-corner" />
         {FORMATION_COLS.map((c) => (
@@ -3819,6 +4074,7 @@ function FormationGrid({
               const isSel = selectedSlot === i;
               const isPick = pickSlot === i;
               const leader = occupied && (s.flags & 0x100) !== 0;
+              const seat = occupied ? seatKinds.find((k) => k.slot === i) : undefined;
               return (
                 <button
                   key={i}
@@ -3829,11 +4085,21 @@ function FormationGrid({
                     isSel ? "selected" : "",
                     isPick ? "pick" : "",
                     leader ? "leader" : "",
+                    seat ? `gear-${seat.kind}` : "",
                   ]
                     .filter(Boolean)
                     .join(" ")}
                   onClick={() => onSelect(i)}
-                  title={`${formationLabel(i)} (slot ${i})`}
+                  title={
+                    `${formationLabel(i)} (slot ${i})` +
+                    (seat
+                      ? ` · ${seatKindText(seat)}${
+                          seat.kind === "none" || seat.kind === "custom"
+                            ? ""
+                            : ` (${TIER_NAMES[seat.tier] ?? seat.tier} tier)`
+                        }`
+                      : "")
+                  }
                 >
                   <span className="formation-pos">
                     {formationLabel(i)}
@@ -3850,6 +4116,15 @@ function FormationGrid({
                         {s.class_symbol}
                         {leader ? " · Lead" : ""}
                       </span>
+                      {seat && (
+                        <span className={`gear-badge gear-${seat.kind}`}>
+                          {seat.kind === "custom"
+                            ? `★ Custom${
+                                seat.defaults ? ` + ${GEAR_KIND_LABEL[seat.band]} defaults` : ""
+                              }`
+                            : GEAR_KIND_LABEL[seat.kind]}
+                        </span>
+                      )}
                     </>
                   ) : (
                     <span className="formation-empty">Empty</span>
@@ -3886,6 +4161,8 @@ function UnitPanel({
   itemSkills,
   equipTables,
   charaOverrideById,
+  gearSkillHint,
+  seatKinds,
   ifMap,
   skillMap,
   sharedPreset,
@@ -3913,6 +4190,10 @@ function UnitPanel({
   itemSkills: Map<number, ItemSkill>;
   equipTables: EquipTables;
   charaOverrideById: Map<number, number>;
+  /** Skills known to be granted by some equipment; `complete` = list is exhaustive. */
+  gearSkillHint: { complete: boolean; skillIds: Set<number> };
+  /** default-gear color coding for each occupied seat of this squad */
+  seatKinds: SeatKind[];
   ifMap: Map<number, string>;
   skillMap: Map<number, { id: number; symbol?: string; name?: string }>;
   sharedPreset: boolean;
@@ -4056,6 +4337,7 @@ function UnitPanel({
       ) {
         return;
       }
+      if (!confirmPresetFits(c.lines as ResolveLine[], c.symbol)) return;
       patch(
         {
           equipaiset_id: c.temp_id,
@@ -4081,10 +4363,25 @@ function UnitPanel({
     ) {
       return;
     }
+    if (!confirmPresetFits((preset?.lines ?? []) as ResolveLine[], preset?.symbol || `${id}`))
+      return;
     patch({
       equipaiset_id: id,
       equipaiset_symbol: preset?.symbol || "",
     });
+  }
+
+  /** Ask before assigning a preset that references skills/slots this unit lacks. */
+  function confirmPresetFits(presetLines: ResolveLine[], name: string): boolean {
+    const bad = checkPresetLines(presetLines).filter((p) => p.severity === "error");
+    if (!bad.length) return true;
+    return window.confirm(
+      `${name} needs skills that ${local.class_symbol} does not have.\n` +
+        "The game can FREEZE when this unit tries to use them:\n\n" +
+        bad.slice(0, 5).map((p) => `• ${p.message}`).join("\n") +
+        (bad.length > 5 ? `\n• …and ${bad.length - 5} more` : "") +
+        "\n\nAssign anyway?"
+    );
   }
 
   // ---- Equipment: explicit items + runtime CreateDefaultEquip preview --------
@@ -4095,44 +4392,30 @@ function UnitPanel({
   }, [itemOptions]);
 
   /** Tier (PARAMSET / CharaSet override) the game uses to fill empty slots. */
-  const equipTier = useMemo(() => {
-    // Baked value is exact (it includes the squad-boss quirk); it is cleared
-    // when the CharaSet is swapped, in which case it is recomputed here.
-    if (local.equip_param !== undefined) return local.equip_param;
-    const ove = charaOverrideById.get(local.charaset_id) ?? 0;
-    const bossOverride = squad.slots.some(
-      (s) =>
-        s.charaset_id > 0 &&
-        (s.slot === local.slot
-          ? ove
-          : (charaOverrideById.get(s.charaset_id) ?? s.chara_param_override ?? 0)) >= 4
-    );
-    return resolveEquipParam(
-      Number(squad.exptype) || 0,
-      Number(squad.paramset) || 0,
-      ove,
-      bossOverride
-    );
-  }, [local.equip_param, local.charaset_id, local.slot, squad, charaOverrideById]);
+  const equipTier = useMemo(
+    () =>
+      resolveSeatTier({
+        bakedTier: local.equip_param,
+        slot: local.slot,
+        charasetId: local.charaset_id,
+        seats: squad.slots,
+        exptype: squad.exptype,
+        paramset: squad.paramset,
+        overrideById: charaOverrideById,
+      }),
+    [local.equip_param, local.charaset_id, local.slot, squad, charaOverrideById]
+  );
 
   const gearPreview = useMemo(
     () =>
-      local.gear.map((g, i) => {
-        // An item the CharaSet (or the user) names explicitly always wins.
-        const rom = g.rom_item_id ?? (g.source === "charaset" ? g.item_id : 0);
-        const explicit = g.edited ? g.item_id || 0 : rom || 0;
-        const fill = explicit
-          ? null
-          : resolveDefaultItem(
-              equipTables,
-              local.class_id,
-              i,
-              equipTier,
-              missionLevel,
-              local.charaset_id
-            );
-        return { explicit, fill, finalId: explicit || fill?.itemId || 0 };
-      }),
+      previewSeatGear(
+        local.gear,
+        equipTables,
+        local.class_id,
+        equipTier,
+        missionLevel,
+        local.charaset_id
+      ),
     [local.gear, local.class_id, local.charaset_id, equipTier, missionLevel, equipTables]
   );
 
@@ -4220,9 +4503,20 @@ function UnitPanel({
         ((l.if0 || 0) === (base.if0 || 0) && (l.if1 || 0) === (base.if1 || 0))
       );
     });
-  const missingExplicitCount = finalResults.filter((l) =>
-    isMissingExplicit(l, classSkillIds)
-  ).length;
+
+  /** Lines of the active preset that reference something this unit does not have. */
+  const checkPresetLines = (presetLines: ResolveLine[]) =>
+    findPresetProblems({
+      presetLines,
+      classLines,
+      className: local.class_symbol || `class ${local.class_id}`,
+      haveSkillIds: classSkillIds,
+      mayComeFromGear: (sid) => !gearSkillHint.complete && gearSkillHint.skillIds.has(sid),
+      skillName: (sid) => skillMap.get(sid)?.name || skillMap.get(sid)?.symbol || "",
+    });
+  const presetProblems =
+    local.equipaiset_id !== 0 || allocation ? checkPresetLines(activePresetLines) : [];
+  const presetErrors = presetProblems.filter((p) => p.severity === "error");
 
   const selectValue = createForUnit
     ? createForUnit.key
@@ -4232,6 +4526,7 @@ function UnitPanel({
     <div>
       <FormationGrid
         squad={squad}
+        seatKinds={seatKinds}
         selectedSlot={slot.slot}
         pickSlot={pickSlot}
         onSelect={(i) => {
@@ -4321,6 +4616,32 @@ function UnitPanel({
             <option value="__create__">Create new empty preset…</option>
           </select>
         </label>
+        {presetProblems.length > 0 && (
+          <div
+            className={presetErrors.length ? "danger-box" : "warn-box"}
+            role="alert"
+          >
+            <strong>
+              {presetErrors.length
+                ? "⛔ This tactics preset can freeze the game on this unit"
+                : "⚠ Check this tactics preset"}
+            </strong>
+            <p>
+              {presetErrors.length
+                ? `${local.class_symbol} does not have the skill${
+                    presetErrors.length > 1 ? "s" : ""
+                  } below. The game freezes when the unit tries to use a skill it ` +
+                  "does not have. Use a preset made for this class, preset 0, or " +
+                  "remove those lines in the Presets tab."
+                : "These lines only work if the unit's equipment grants the skill."}
+            </p>
+            <ul>
+              {presetProblems.map((p) => (
+                <li key={`${p.severity}-${p.line}`}>{p.message}</li>
+              ))}
+            </ul>
+          </div>
+        )}
         {local.equipaiset_id !== 0 && (
           <button
             type="button"
@@ -4428,18 +4749,6 @@ function UnitPanel({
             Its effects are all class-slot markers, so it resolves to the same
             class skills the unit would use with no preset. Add an explicit skill
             or change the order / IF conditions to make it behave differently.
-          </p>
-        </div>
-      )}
-      {missingExplicitCount > 0 && (
-        <div className="warn-box">
-          <strong>
-            ⚠ {missingExplicitCount} explicit skill
-            {missingExplicitCount > 1 ? "s are" : " is"} inert for this unit.
-          </strong>
-          <p>
-            Presets don’t grant skills. Flagged rows aren’t provided by this
-            unit’s class or its equipped gear, so they do nothing in-game.
           </p>
         </div>
       )}

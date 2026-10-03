@@ -149,7 +149,9 @@ export function tacticsForPreset(
     if (s1) entry.if1_symbol = s1;
 
     if (refKind === "class_slot" || isClassMarker(sid)) {
-      const base = byAction.get(sid);
+      // Older forked lines keep the marker in `action` and the resolved skill in skill_id.
+      const markerRef = isClassMarker(sid) ? sid : ln.action || 0;
+      const base = byAction.get(markerRef);
       if (!base) continue;
       entry.action = base.action || sid;
       entry.skill_id = base.skill_id || 0;

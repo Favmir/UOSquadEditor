@@ -104,3 +104,138 @@ export function resolveDefaultItem(
     tier,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Shared per-seat helpers (used by the unit panel, the formation grid and the
+// squad list so they all agree).
+// ---------------------------------------------------------------------------
+
+export type SeatForTier = {
+  slot: number;
+  charaset_id: number;
+  chara_param_override?: number;
+};
+
+/**
+ * Tier a seat's empty gear slots are filled with. `bakedTier` is exact when the
+ * seat is unchanged (it includes the squad-boss quirk); it is undefined after the
+ * CharaSet was swapped, in which case the tier is recomputed from the squad.
+ */
+export function resolveSeatTier(o: {
+  bakedTier?: number;
+  slot: number;
+  charasetId: number;
+  seats: SeatForTier[];
+  exptype?: number | string;
+  paramset?: number;
+  overrideById: Map<number, number>;
+}): number {
+  if (o.bakedTier !== undefined) return o.bakedTier;
+  const ove = o.overrideById.get(o.charasetId) ?? 0;
+  const bossOverride = o.seats.some(
+    (s) =>
+      s.charaset_id > 0 &&
+      (s.slot === o.slot
+        ? ove
+        : (o.overrideById.get(s.charaset_id) ?? s.chara_param_override ?? 0)) >= 4
+  );
+  return resolveEquipParam(
+    Number(o.exptype) || 0,
+    Number(o.paramset) || 0,
+    ove,
+    bossOverride
+  );
+}
+
+export type GearLike = {
+  item_id?: number;
+  rom_item_id?: number;
+  source?: string;
+  edited?: boolean;
+};
+
+export type SeatGearSlot = {
+  /** item the CharaSet (or the user) names explicitly; 0 = runtime fill */
+  explicit: number;
+  fill: DefaultItem | null;
+  finalId: number;
+};
+
+/** For each of the 4 gear slots: the explicit item, else what the game fills in. */
+export function previewSeatGear(
+  gear: GearLike[],
+  tables: EquipTables,
+  classId: number,
+  tier: number,
+  level: number,
+  charasetId: number
+): SeatGearSlot[] {
+  return gear.map((g, i) => {
+    // An item the CharaSet (or the user) names explicitly always wins.
+    const rom = g.rom_item_id ?? (g.source === "charaset" ? g.item_id : 0);
+    const explicit = g.edited ? g.item_id || 0 : rom || 0;
+    const fill = explicit
+      ? null
+      : resolveDefaultItem(tables, classId, i, tier, level, charasetId);
+    return { explicit, fill, finalId: explicit || fill?.itemId || 0 };
+  });
+}
+
+/**
+ * How a seat is equipped, for color coding.
+ *  - custom: at least one slot holds an item that is NOT default equipment (named in
+ *    the CharaSet or placed by hand). Mixed units count too: they are "important".
+ *  - default / normal / power / boss: every equipped slot comes from that default band.
+ *  - none: nothing equipped at all.
+ */
+export type GearKind = "default" | "normal" | "power" | "boss" | "custom" | "none";
+
+export const GEAR_KIND_LABEL: Record<GearKind, string> = {
+  default: "Default",
+  normal: "Normal",
+  power: "Power",
+  boss: "Boss",
+  custom: "Custom",
+  none: "No gear",
+};
+
+export type GearBand = "default" | "normal" | "power" | "boss";
+
+export function bandOfTier(tier: number): GearBand {
+  return tier === 4 ? "boss" : tier === 3 ? "power" : tier === 2 ? "normal" : "default";
+}
+
+export type GearInfo = {
+  kind: GearKind;
+  /** the default band empty slots are filled from (meaningful when defaultCount > 0) */
+  band: GearBand;
+  /** slots holding an item that is not default equipment */
+  explicitCount: number;
+  /** slots filled from the default band */
+  defaultCount: number;
+};
+
+export function gearInfoOf(slots: SeatGearSlot[], tier: number): GearInfo {
+  const explicitCount = slots.filter((s) => s.explicit > 0).length;
+  const defaultCount = slots.filter((s) => !s.explicit && (s.fill?.itemId ?? 0) > 0).length;
+  const band = bandOfTier(tier);
+  const kind: GearKind =
+    explicitCount > 0 ? "custom" : defaultCount > 0 ? band : "none";
+  return { kind, band, explicitCount, defaultCount };
+}
+
+const KIND_RANK: Record<GearKind, number> = {
+  none: 0,
+  default: 1,
+  normal: 2,
+  power: 3,
+  boss: 4,
+  custom: 5,
+};
+
+/** Most notable kind in a squad (custom > boss > power > normal > default > none). */
+export function topGearKind(kinds: GearKind[]): GearKind | null {
+  let best: GearKind | null = null;
+  for (const k of kinds) if (best === null || KIND_RANK[k] > KIND_RANK[best]) best = k;
+  return best;
+}

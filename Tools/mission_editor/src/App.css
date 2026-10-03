@@ -68,14 +68,20 @@ h3 {
 
 .layout {
   display: grid;
-  grid-template-columns: 260px minmax(340px, 0.8fr) minmax(0, 2fr);
+  /* mission list panel grows with the number of list columns */
+  grid-template-columns:
+    min(45vw, max(260px, calc(var(--list-cols, 4) * 9.5rem + 1.6rem)))
+    minmax(340px, 0.8fr)
+    minmax(0, 2fr);
   gap: 0.85rem;
   min-height: 70vh;
 }
 
 .catalog-layout {
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr);
+  grid-template-columns:
+    min(45vw, max(300px, calc(var(--list-cols, 4) * 9.5rem + 1.6rem)))
+    minmax(0, 1fr);
   gap: 0.85rem;
   min-height: 70vh;
 }
@@ -87,6 +93,7 @@ h3 {
 
 .view-tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.35rem;
   margin-bottom: 0.85rem;
 }
@@ -144,9 +151,21 @@ h3 {
   list-style: none;
   margin: 0;
   padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.35rem;
+  display: grid;
+  grid-template-columns: repeat(var(--list-cols, 4), minmax(0, 1fr));
+  align-content: start;
+  gap: 0.3rem;
+}
+.list > li {
+  min-width: 0;
+}
+/* two-line items (squads) use at most 2 columns */
+.list.list-narrow {
+  grid-template-columns: repeat(var(--list-cols-narrow, 2), minmax(0, 1fr));
+}
+/* small helper lists stay a single column */
+.list.list-single {
+  grid-template-columns: 1fr;
 }
 
 .list button,
@@ -164,7 +183,29 @@ h3 {
 .list button span {
   display: block;
   color: var(--muted);
-  font-size: 0.78rem;
+  font-size: 0.74rem;
+}
+
+/* compact items so more fit on screen; full text is in the tooltip */
+.list button {
+  padding: 0.38rem 0.5rem;
+  height: 100%;
+}
+.list button strong {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 0.82rem;
+  line-height: 1.2;
+  /* identifiers break after "_" (zero-width spaces); this is only the fallback */
+  overflow-wrap: break-word;
+}
+.list button > span:not(.gear-dots) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .list button.active,
@@ -833,4 +874,155 @@ button.linkish {
   gap: 0.35rem;
   font-size: 0.85rem;
   color: var(--muted);
+}
+
+.danger-box {
+  margin: 0.6rem 0;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid #e0a0a0;
+  border-left: 4px solid #c0392b;
+  border-radius: 8px;
+  background: #fdecea;
+}
+.danger-box strong {
+  display: block;
+  color: #b3261e;
+  margin-bottom: 0.2rem;
+}
+.danger-box p {
+  margin: 0 0 0.3rem;
+  font-size: 0.86rem;
+  color: #6d2a25;
+}
+.danger-box ul {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: 0.86rem;
+  color: #8a2b24;
+}
+.warn-box ul {
+  margin: 0.3rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.86rem;
+  color: #6b4a2c;
+}
+
+/* ---- Default-gear color coding (squad list + formation grid) ---------------- */
+:root {
+  --gear-default: #7b8794;
+  --gear-normal: #2f8f5b;
+  --gear-power: #d9822b;
+  --gear-boss: #c0392b;
+  --gear-custom: #7a3fb5;
+  --gear-none: #b5bcc4;
+}
+
+.gear-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.2rem 0.6rem;
+  margin: 0.3rem 0 0.5rem;
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+.gear-legend-title {
+  font-weight: 700;
+}
+.gear-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.gear-dot {
+  display: inline-block;
+  width: 0.62rem;
+  height: 0.62rem;
+  border-radius: 50%;
+  background: var(--gear-default);
+  vertical-align: middle;
+}
+.gear-dots {
+  display: flex !important;
+  gap: 0.25rem;
+  margin-top: 0.25rem;
+}
+.gear-dot.gear-default { background: var(--gear-default); }
+.gear-dot.gear-normal { background: var(--gear-normal); }
+.gear-dot.gear-power { background: var(--gear-power); }
+.gear-dot.gear-boss { background: var(--gear-boss); }
+.gear-dot.gear-custom {
+  background: var(--gear-custom);
+  box-shadow: 0 0 0 2px #e4d6f3;
+}
+.gear-dot.gear-none { background: var(--gear-none); }
+
+/* squad list: colored bar = highest default-gear band among its units */
+.list button.gear-default,
+.list button.gear-normal,
+.list button.gear-power,
+.list button.gear-boss,
+.list button.gear-custom,
+.list button.gear-none {
+  border-left-width: 4px;
+}
+.list button.gear-default { border-left-color: var(--gear-default); }
+.list button.gear-normal { border-left-color: var(--gear-normal); }
+.list button.gear-power { border-left-color: var(--gear-power); }
+.list button.gear-boss { border-left-color: var(--gear-boss); }
+.list button.gear-custom {
+  border-left-color: var(--gear-custom);
+  border-left-width: 6px;
+}
+.list button.gear-none { border-left-color: var(--gear-none); }
+
+/* formation grid: colored edge + badge per unit */
+.formation-cell.gear-default,
+.formation-cell.gear-normal,
+.formation-cell.gear-power,
+.formation-cell.gear-boss,
+.formation-cell.gear-custom,
+.formation-cell.gear-none {
+  border-left-width: 5px;
+}
+.formation-cell.gear-default { border-left-color: var(--gear-default); }
+.formation-cell.gear-normal { border-left-color: var(--gear-normal); }
+.formation-cell.gear-power { border-left-color: var(--gear-power); }
+.formation-cell.gear-boss { border-left-color: var(--gear-boss); }
+.formation-cell.gear-custom {
+  border-left-color: var(--gear-custom);
+  border-left-width: 7px;
+  background: #f7f1fc;
+}
+.formation-cell.gear-none { border-left-color: var(--gear-none); }
+
+.gear-badge {
+  align-self: flex-start;
+  margin-top: 0.1rem;
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  font-size: 0.64rem;
+  font-weight: 700;
+  line-height: 1.35;
+  color: #fff;
+  background: var(--gear-default);
+}
+.gear-badge.gear-normal { background: var(--gear-normal); }
+.gear-badge.gear-power { background: var(--gear-power); }
+.gear-badge.gear-boss { background: var(--gear-boss); }
+.gear-badge.gear-custom { background: var(--gear-custom); }
+.gear-badge.gear-none { background: var(--gear-none); }
+
+.list-cols-control {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.list-cols-control button {
+  padding: 0.3rem 0.6rem;
+  min-width: 2rem;
 }
