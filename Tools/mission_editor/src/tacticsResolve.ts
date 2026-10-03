@@ -16,6 +16,8 @@ export type ResolveLine = {
   from_item?: boolean;
   from_equipaiset_preset?: boolean;
   ref_kind?: string;
+  /** Display only: what a class-slot marker line resolves to. */
+  resolved_skill_id?: number;
 };
 
 export type ClassLine = ResolveLine & {
@@ -64,11 +66,19 @@ export function tacticsForClass(
   ifs: Map<number, string>
 ): ResolveLine[] {
   const lvl = unitLevel > 0 ? unitLevel : 1;
-  const classRows = classLines.map((line) => ({
-    ...line,
-    locked: (line.learn_level || 1) > lvl,
-    from_class_default: true,
-  }));
+  const classRows = classLines.map((line) => {
+    // Always label conditions from the IF list: an edited class row may carry only
+    // the id (or a stale label from before it was changed).
+    const s0 = ifSym(line.if0 || 0, ifs) ?? line.if0_symbol;
+    const s1 = ifSym(line.if1 || 0, ifs) ?? line.if1_symbol;
+    return {
+      ...line,
+      if0_symbol: line.if0 ? s0 : undefined,
+      if1_symbol: line.if1 ? s1 : undefined,
+      locked: (line.learn_level || 1) > lvl,
+      from_class_default: true,
+    };
+  });
   const actives = classRows.filter((r) => (r.action || 0) < 7);
   const passives = classRows.filter((r) => (r.action || 0) >= 7);
   const have = new Set(
@@ -180,4 +190,78 @@ export function resolveMarkerHint(
     skill_name: skills?.get(base.skill_id)?.name || base.skill_name || "",
     skill_symbol: base.skill_symbol || "",
   };
+}
+
+/**
+ * Turn resolved ("final") tactics back into editable preset lines WITHOUT losing
+ * what each line means in the game:
+ *  - lines that come from the class table are stored as class-slot MARKERS
+ *    (skill_id = marker 3..10), exactly like vanilla presets, so they keep
+ *    following the unit's class defaults;
+ *  - everything else (item / explicit skills) stays a concrete skill id.
+ * Writing the resolved skill id for class lines (what the baked unit lines hold)
+ * would silently turn them into fixed skills.
+ */
+export function toEditableLines(final: ResolveLine[]): ResolveLine[] {
+  return final.map((ln, i) => {
+    const marker = ln.action || 0;
+    const isClassLine =
+      (ln.ref_kind === "class_slot" || ln.from_class_default) &&
+      !ln.from_item &&
+      isClassMarker(marker);
+    if (!isClassLine) {
+      return { ...ln, slot: i };
+    }
+    return {
+      ...ln,
+      slot: i,
+      skill_id: marker,
+      ref_kind: "class_slot",
+      // keep what it resolves to for display only
+      resolved_skill_id: ln.skill_id || 0,
+    } as ResolveLine;
+  });
+}
+
+export type SkillIfEdit = { skill_id: number; if0?: number; if1?: number };
+
+/** Apply per-skill default-IF edits to one line (only the fields that are set). */
+export function withSkillIfEdit<T extends { skill_id?: number; if0?: number; if1?: number; if0_symbol?: string; if1_symbol?: string }>(
+  line: T,
+  edits: Map<number, SkillIfEdit>,
+  ifLabel: (id: number) => string | undefined
+): T {
+  const e = edits.get(Number(line.skill_id || 0));
+  if (!e) return line;
+  const next = { ...line };
+  if (e.if0 !== undefined) {
+    next.if0 = e.if0;
+    next.if0_symbol = e.if0 ? ifLabel(e.if0) : undefined;
+  }
+  if (e.if1 !== undefined) {
+    next.if1 = e.if1;
+    next.if1_symbol = e.if1 ? ifLabel(e.if1) : undefined;
+  }
+  return next;
+}
+
+/**
+ * Class default tactics as they will be AFTER the pending edits: class-slot edits
+ * replace a class's list, then per-skill default-IF edits apply on top (same
+ * precedence as the exporter).
+ */
+export function overlayClassEdits<L extends ResolveLine, E extends { class_id: number; lines: L[] }>(
+  base: E[],
+  classEdits: { class_id: number; lines: L[] }[],
+  skillIfEdits: SkillIfEdit[],
+  ifLabel: (id: number) => string | undefined
+): E[] {
+  if (!classEdits.length && !skillIfEdits.length) return base;
+  const byClass = new Map<number, L[]>(classEdits.map((c): [number, L[]] => [c.class_id, c.lines]));
+  const ifEdits = new Map<number, SkillIfEdit>(skillIfEdits.map((e): [number, SkillIfEdit] => [e.skill_id, e]));
+  return base.map((entry) => {
+    let lines = byClass.get(entry.class_id) ?? entry.lines;
+    if (ifEdits.size) lines = lines.map((ln) => withSkillIfEdit(ln, ifEdits, ifLabel));
+    return lines === entry.lines ? entry : { ...entry, lines };
+  });
 }

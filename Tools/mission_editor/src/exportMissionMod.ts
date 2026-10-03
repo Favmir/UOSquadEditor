@@ -103,6 +103,18 @@ export type ExportEdits = {
     lines?: ExportLine[];
   }[];
   class_tactics?: { class_id: number; lines?: ExportLine[] }[];
+  /**
+   * Opt-in: also treat existing presets as free when EVERY reference to them is in
+   * one of these contexts (e.g. "Arena", "OFFLINE", "Overworld"). Their rows are
+   * overwritten, so those modes lose the original preset. Default: none.
+   */
+  reuse_preset_contexts?: string[];
+  /**
+   * Per-skill default IF0/IF1 (skill table row +0xAC/+0xB0). These are shared by
+   * class slots AND equipment-granted skills. Only fields that are present are
+   * written, so an unknown vanilla value is never overwritten by accident.
+   */
+  skill_default_ifs?: { skill_id: number; if0?: number; if1?: number }[];
   equiptype_items?: {
     equiptype_id?: number;
     id?: number;
@@ -345,16 +357,55 @@ export function buildMissionMod(
   const equiptypeItemEdits = edits.equiptype_items || [];
   const classEtEdits = edits.class_equiptypes || [];
 
+  // Rows that are normally "in use" but only by contexts the user opted to give up.
+  const reuseContexts = new Set(
+    (edits.reuse_preset_contexts || []).map((c) => String(c).toLowerCase())
+  );
+  const pinned = new Set<number>();
+  for (const k of Object.keys(tacticsOverrides)) pinned.add(Number(k));
+  for (const c of creates) if (Number(c.source_id) > 0) pinned.add(Number(c.source_id));
+  for (const a of allocations) {
+    const sid = Number(a.source_id || a.from_id || 0);
+    if (sid > 0) pinned.add(sid);
+  }
+  for (const ue of unitEdits)
+    for (const sl of ue.slots || []) {
+      const e = Number(sl.equipaiset_id || 0);
+      if (e > 0) pinned.add(e);
+    }
+  const reclaimable: number[] = [];
+  if (reuseContexts.size) {
+    for (const p of catalog.equipaiset_presets || []) {
+      const refs = p.references || [];
+      if (!p.id || !p.usage || !refs.length || pinned.has(p.id)) continue;
+      if (refs.every((r) => reuseContexts.has(String(r.context || "").toLowerCase()))) {
+        reclaimable.push(p.id);
+      }
+    }
+    reclaimable.sort((a, b) => b - a);
+  }
+  const failedCreates: string[] = [];
+  const failedAllocs: string[] = [];
+  let reusedCount = 0;
+
   const takeId = (want: unknown, key: string): number | null => {
     if (want != null && String(want).match(/^\d+$/) && Number(want) > 0) {
       return Number(want);
     }
     const frees = findFreeEquipaisets(1, reservedEa, eaUsed);
-    if (!frees.length) {
-      notes.push(`WARNING: no free EquipAiSet for ${key}`);
-      return null;
+    if (frees.length) return frees[0];
+    const reuse = reclaimable.find((id) => !reservedEa.has(id));
+    if (reuse != null) {
+      reusedCount++;
+      const was = presetLabels.get(reuse) || `EquipAiSet ${reuse}`;
+      const refs = (catalog.equipaiset_presets || []).find((x) => x.id === reuse)?.references || [];
+      const where = [...new Set(refs.map((r) => String(r.context || "?")))].join("/");
+      const msg = `Reused EquipAiSet ${reuse} (${was}, normally used only by ${where}) for ${key}; that original preset is overwritten.`;
+      notes.push(msg);
+      changes.push(msg);
+      return reuse;
     }
-    return frees[0];
+    return null;
   };
 
   for (const create of creates) {
@@ -366,7 +417,10 @@ export function buildMissionMod(
     const src = Number(create.source_id || 0);
     const lines = normalizeLines(create.lines);
     const newId = takeId(create.new_id, `create ${key}`);
-    if (newId == null || newId === 0) continue;
+    if (newId == null || newId === 0) {
+      failedCreates.push(String(create.symbol || key));
+      continue;
+    }
     reservedEa.add(newId);
     allocatedIds.add(newId);
     eaUsed.set(newId, (eaUsed.get(newId) || 0) + 1);
@@ -384,13 +438,16 @@ export function buildMissionMod(
   for (const alloc of allocations) {
     const src = Number(alloc.source_id || alloc.from_id || 0);
     const lines = normalizeLines(alloc.lines);
-    const newId = takeId(alloc.new_id, `alloc from ${src}`);
-    if (newId == null || newId === 0) continue;
-    reservedEa.add(newId);
-    allocatedIds.add(newId);
     const unitLabel =
       unitLabels.get(`${Number(alloc.unitset_id || 0)}:${Number(alloc.slot || 0)}`) ||
       `UnitSet ${alloc.unitset_id ?? "?"} slot ${alloc.slot ?? "?"}`;
+    const newId = takeId(alloc.new_id, `alloc from ${src}`);
+    if (newId == null || newId === 0) {
+      failedAllocs.push(unitLabel);
+      continue;
+    }
+    reservedEa.add(newId);
+    allocatedIds.add(newId);
     writeTacticsRow(patches, newId, lines, notes);
     tacticsOverrides[String(newId)] = lines;
     const change = `Allocated private EquipAiSet ${src} -> ${newId} for ${unitLabel} (${lines.length} tactics slots)`;
@@ -402,6 +459,37 @@ export function buildMissionMod(
     if (alloc.unitset_id != null && alloc.slot != null) {
       eaMap.set(`${alloc.unitset_id}:${alloc.slot}`, newId);
     }
+  }
+
+  if (failedCreates.length || failedAllocs.length) {
+    const freeNow = (catalog.equipaiset_presets || []).filter(
+      (p) => p.id > 0 && !p.usage
+    ).length;
+    const lines = [
+      `WARNING: EquipAiSet LIMIT REACHED. The game has only ${EQUIPAISET_COUNT - 1} preset rows ` +
+        `(ids 1-${EQUIPAISET_COUNT - 1}) and the table cannot be extended. ` +
+        `Only ${freeNow} are unreferenced in the base game` +
+        (reusedCount ? ` (+${reusedCount} reused from opted-in modes)` : "") +
+        `. ${failedCreates.length + failedAllocs.length} requested row(s) could NOT be created.`,
+    ];
+    if (failedCreates.length) {
+      lines.push(
+        `WARNING: Not created (${failedCreates.length}): ${failedCreates.join(", ")}. ` +
+          `Units assigned to these were exported with preset 0 (class defaults).`
+      );
+    }
+    if (failedAllocs.length) {
+      lines.push(
+        `WARNING: Per-unit tactics NOT applied (${failedAllocs.length}): ${failedAllocs.join("; ")}. ` +
+          `These units keep their original preset.`
+      );
+    }
+    lines.push(
+      `WARNING: To fix: delete created presets you do not need, share one preset between ` +
+        `units, or enable "Reuse presets used only by Arena/OFFLINE/Overworld" in the Presets tab.`
+    );
+    notes.unshift(...lines);
+    changes.unshift(...lines, "");
   }
 
   for (const ce of charaEdits) {
@@ -446,6 +534,8 @@ export function buildMissionMod(
     changes.push(change);
   }
 
+  const skillIfWrites = new Map<number, { if0?: number; if1?: number }>();
+
   for (const classEdit of classEdits) {
     const classId = Number(classEdit.class_id);
     const classBase = CLASS_SKILL_BASE + classId * CLASS_SKILL_STRIDE;
@@ -483,13 +573,11 @@ export function buildMissionMod(
       classWords[levelOff] = learnLevel;
       classWords[skillOff] = skillId;
       if (skillId > 0 && skillId < SKILL_TABLE_COUNT) {
-        const skillRow = EQUIPAISET_BASE + skillId * EQUIPAISET_STRIDE;
-        patches.push(
-          pchtxtWord(skillRow + SKILL_DEFAULT_IF0_OFF, Number(line.if0 || 0))
-        );
-        patches.push(
-          pchtxtWord(skillRow + SKILL_DEFAULT_IF1_OFF, Number(line.if1 || 0))
-        );
+        // Collected and emitted once below so explicit skill-default edits can win.
+        skillIfWrites.set(skillId, {
+          if0: Number(line.if0 || 0),
+          if1: Number(line.if1 || 0),
+        });
       }
     }
     for (const off of Object.keys(classWords)
@@ -501,6 +589,43 @@ export function buildMissionMod(
     notes.push(change);
     changes.push(change);
     changes.push(...lines.map((line) => `  - ${describeLine(line, skills, ifs)}`));
+  }
+
+  // Explicit per-skill default conditions (also what equipment-granted skills use).
+  for (const se of edits.skill_default_ifs || []) {
+    const sid = Number(se.skill_id || 0);
+    if (!(sid > 0 && sid < SKILL_TABLE_COUNT)) {
+      notes.push(`WARNING: skill default IF edit skips invalid skill id ${sid}`);
+      continue;
+    }
+    const cur = skillIfWrites.get(sid) || {};
+    const clampIf = (v: unknown): number | undefined => {
+      if (v == null) return undefined;
+      const n = Number(v);
+      return Number.isInteger(n) && n >= 0 && n < N_IFS ? n : 0;
+    };
+    const i0 = clampIf(se.if0);
+    const i1 = clampIf(se.if1);
+    skillIfWrites.set(sid, {
+      if0: i0 !== undefined ? i0 : cur.if0,
+      if1: i1 !== undefined ? i1 : cur.if1,
+    });
+    const label = skills.get(sid) || `skill ${sid}`;
+    const parts: string[] = [];
+    const ifName = (v: number) => (v === 0 ? "none" : ifs.get(v) || "?");
+    if (i0 !== undefined) parts.push(`IF0=${ifName(i0)} (${i0})`);
+    if (i1 !== undefined) parts.push(`IF1=${ifName(i1)} (${i1})`);
+    const change = `Changed default condition of ${label} (${sid}): ${parts.join("; ")}`;
+    notes.push(change);
+    changes.push(change);
+  }
+  for (const sid of [...skillIfWrites.keys()].sort((a, b) => a - b)) {
+    const w = skillIfWrites.get(sid)!;
+    const skillRow = EQUIPAISET_BASE + sid * EQUIPAISET_STRIDE;
+    if (w.if0 !== undefined)
+      patches.push(pchtxtWord(skillRow + SKILL_DEFAULT_IF0_OFF, w.if0));
+    if (w.if1 !== undefined)
+      patches.push(pchtxtWord(skillRow + SKILL_DEFAULT_IF1_OFF, w.if1));
   }
 
   for (const etEdit of equiptypeItemEdits) {

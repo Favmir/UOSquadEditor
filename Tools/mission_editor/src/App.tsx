@@ -10,11 +10,22 @@ import {
   resolveMarkerHint,
   tacticsForClass,
   tacticsForPreset,
+  toEditableLines,
+  overlayClassEdits,
+  withSkillIfEdit,
+  type SkillIfEdit,
   type ClassLine,
   type ItemSkill,
   type ResolveLine,
 } from "./tacticsResolve";
 import { buildMissionMod, SKILL_TABLE_COUNT } from "./exportMissionMod";
+import { dropPresetsFromEdits } from "./presetEdits";
+import {
+  resolveDefaultItem,
+  resolveEquipParam,
+  TIER_NAMES,
+  type EquipTables,
+} from "./defaultEquip";
 import { overlayPchtxtOnCatalog } from "./resolvePchtxt";
 import { unzipTextFiles, zipStore } from "./zipStore";
 
@@ -76,7 +87,9 @@ type Squad = {
   unitset_symbol: string;
   side: string;
   role?: string;
+  paramset?: number;
   paramset_name?: string;
+  exptype?: string | number;
   exptype_name?: string;
   join_source?: string;
   slots: Slot[];
@@ -137,6 +150,8 @@ type CharasetCatalogEntry = {
   class_id: number;
   class_symbol: string;
   class_name?: string;
+  /** CharaSet +0x1E (equip tier override). Present after a data rebuild. */
+  equip_param_override?: number;
   gear: Gear[];
 };
 
@@ -174,6 +189,8 @@ type Doc = {
   equiptype_items?: EquiptypeItem[];
   class_equiptypes?: ClassEquiptypes[];
   equipaiset_presets?: EquipAiPreset[];
+  /** Equipment -> granted skill (+ its default IFs). Present after a data rebuild. */
+  item_skills?: { item_id: number; skill_id: number; if0?: number; if1?: number }[];
 };
 
 type Allocation = {
@@ -225,7 +242,20 @@ type Edits = {
     class_id: number;
     slots: number[];
   }[];
+  /** Per-skill default IF0/IF1. Only fields present are exported. */
+  skill_default_ifs: { skill_id: number; if0?: number; if1?: number }[];
+  /** Opt-in: contexts whose presets may be overwritten to get more EquipAiSet rows. */
+  reuse_preset_contexts: string[];
 };
+
+/** Catch-all region for missions whose data has no region (the OW_GK_* "The Battle for …" ones). */
+const MISC_REGION = "Misc";
+const missionRegion = (m: { region?: string }): string =>
+  (m.region || "").trim() || MISC_REGION;
+
+/** Preset contexts that are not story-mission squads (see reuse option). */
+const ARENA_CONTEXTS = ["Arena", "OFFLINE"];
+const OVERWORLD_CONTEXTS = ["Overworld"];
 
 const DATA_URL = `${import.meta.env.BASE_URL}data/mission_squads.json`;
 const MODS_STORAGE_KEY = "uo_mission_editor_mod_paths";
@@ -239,6 +269,8 @@ const EMPTY_EDITS: Edits = {
   class_tactics: [],
   equiptype_items: [],
   class_equiptypes: [],
+  skill_default_ifs: [],
+  reuse_preset_contexts: [],
 };
 
 function parseImportedEdits(value: unknown): Edits {
@@ -282,6 +314,10 @@ function parseImportedEdits(value: unknown): Edits {
     class_tactics: array("class_tactics") as Edits["class_tactics"],
     equiptype_items: array("equiptype_items") as Edits["equiptype_items"],
     class_equiptypes: array("class_equiptypes") as Edits["class_equiptypes"],
+    skill_default_ifs: array("skill_default_ifs") as Edits["skill_default_ifs"],
+    reuse_preset_contexts: array(
+      "reuse_preset_contexts"
+    ) as Edits["reuse_preset_contexts"],
   };
 }
 
@@ -551,7 +587,7 @@ function refreshEditsSkillNames(
 
 function App() {
   const [view, setView] = useState<
-    "missions" | "classes" | "presets" | "equiptypes"
+    "missions" | "classes" | "presets" | "equiptypes" | "skills"
   >("missions");
   const [doc, setDoc] = useState<Doc | null>(null);
   const [err, setErr] = useState<string>("");
@@ -935,10 +971,12 @@ function App() {
   const regions = useMemo(() => {
     if (!doc) return [] as string[];
     const set = new Set<string>();
-    for (const m of doc.missions) {
-      if (m.region) set.add(m.region);
-    }
-    return [...set].sort((a, b) => a.localeCompare(b));
+    for (const m of doc.missions) set.add(missionRegion(m));
+    // Named regions alphabetically, the Misc catch-all always last.
+    const named = [...set]
+      .filter((r) => r !== MISC_REGION)
+      .sort((a, b) => a.localeCompare(b));
+    return set.has(MISC_REGION) ? [...named, MISC_REGION] : named;
   }, [doc]);
 
   const missions = useMemo(() => {
@@ -946,12 +984,12 @@ function App() {
     const q = filter.trim().toLowerCase();
     const filtered = doc.missions.filter((m) => {
       if (!m.squads.length) return false;
-      if (regionFilter !== "ALL" && m.region !== regionFilter) return false;
+      if (regionFilter !== "ALL" && missionRegion(m) !== regionFilter) return false;
       if (!q) return true;
       return (
         m.stage_name.toLowerCase().includes(q) ||
         m.quest_symbol.toLowerCase().includes(q) ||
-        m.region.toLowerCase().includes(q) ||
+        missionRegion(m).toLowerCase().includes(q) ||
         m.squads.some(
           (s) =>
             s.unitset_symbol.toLowerCase().includes(q) ||
@@ -1269,6 +1307,19 @@ function App() {
     const sourceId = unit.equipaiset_id;
     const key = allocKey(squad.unitset_id, unit.slot);
     const shared = sourceId === 0 || (equipAiUsage.get(sourceId) || 0) > 1;
+    if (
+      shared &&
+      !edits.equipaiset_allocations.some((a) => a.key === key) &&
+      presetBudget.left <= 0 &&
+      !window.confirm(
+        `Editing this unit's tactics needs its own EquipAiSet row, but none are ` +
+          `left (${presetBudget.capacity} available, ${presetBudget.needed} already ` +
+          `requested). The edit will NOT be exported unless you free a row ` +
+          `(delete a created preset) or enable "Reuse presets" in the Presets tab.\n\nContinue?`
+      )
+    ) {
+      return;
+    }
 
     setEdits((prev) => {
       const existingAlloc = prev.equipaiset_allocations.find((a) => a.key === key);
@@ -1339,13 +1390,25 @@ function App() {
       edits.class_tactics.length > 0 ||
       edits.equiptype_items.length > 0 ||
       edits.class_equiptypes.length > 0 ||
+      edits.skill_default_ifs.length > 0 ||
       edits.equipaiset_allocations.length > 0 ||
       edits.equipaiset_creates.length > 0 ||
       Object.keys(edits.equipaiset_lines).length > 0
     );
   }
 
-  function createEmptyPreset(sourceId = 0): PresetCreate {
+  function createEmptyPreset(sourceId = 0): PresetCreate | null {
+    if (
+      presetBudget.left <= 0 &&
+      !window.confirm(
+        `No free EquipAiSet rows left (${presetBudget.capacity} available, ` +
+          `${presetBudget.needed} already requested).\n\nThe game's preset table ` +
+          `has a fixed size. A new preset cannot be exported unless you delete ` +
+          `another one or enable "Reuse presets" in the Presets tab.\n\nCreate it anyway?`
+      )
+    ) {
+      return null;
+    }
     const key = `create:${createSeq}`;
     const temp_id = -createSeq;
     setCreateSeq((n) => n + 1);
@@ -1367,6 +1430,88 @@ function App() {
         `It does not affect units until you assign it — assigning while empty wipes tactics.`
     );
     return created;
+  }
+
+  /** Original (unedited) seat values, used to revert seat edits cleanly. */
+  function originalSeat(unitsetId: number, slotIndex: number) {
+    for (const m of doc?.missions ?? [])
+      for (const sq of m.squads)
+        if (sq.unitset_id === unitsetId)
+          return sq.slots.find((x) => x.slot === slotIndex);
+    return undefined;
+  }
+
+  /**
+   * Remove created presets and/or per-unit private copies and put every affected
+   * seat back to its original preset. Seat edits that end up identical to the
+   * original are dropped entirely.
+   */
+  function dropPresets(tempIds: Set<number>, allocKeys: Set<string>) {
+    setEdits((prev) =>
+      dropPresetsFromEdits(prev, tempIds, allocKeys, originalSeat)
+    );
+  }
+
+  function seatsUsingCreated(tempId: number): number {
+    return edits.unitsets.reduce(
+      (n, ue) => n + ue.slots.filter((s) => s.equipaiset_id === tempId).length,
+      0
+    );
+  }
+
+  function deleteCreatedPreset(tempId: number) {
+    const c = edits.equipaiset_creates.find((x) => x.temp_id === tempId);
+    if (!c) return;
+    const seats = seatsUsingCreated(tempId);
+    if (
+      !window.confirm(
+        `Delete created preset ${c.symbol}?` +
+          (seats
+            ? `\n\n${seats} unit seat(s) use it and will go back to their original preset.`
+            : "")
+      )
+    )
+      return;
+    dropPresets(new Set([tempId]), new Set());
+    setPresetId(null);
+    setExportMsg(`Deleted created preset ${c.symbol}.`);
+  }
+
+  function deleteUnassignedCreated() {
+    const unassigned = edits.equipaiset_creates.filter(
+      (c) => seatsUsingCreated(c.temp_id) === 0
+    );
+    if (!unassigned.length) return;
+    if (
+      !window.confirm(
+        `Delete ${unassigned.length} created preset(s) that no unit uses?\n\n` +
+          unassigned.map((c) => c.symbol).join(", ")
+      )
+    )
+      return;
+    dropPresets(new Set(unassigned.map((c) => c.temp_id)), new Set());
+    setPresetId(null);
+    setExportMsg(`Deleted ${unassigned.length} unassigned created preset(s).`);
+  }
+
+  function removePrivateCopy(key: string) {
+    dropPresets(new Set(), new Set([key]));
+    setExportMsg(
+      "Removed the per-unit tactics copy; that unit uses its original preset again."
+    );
+  }
+
+  function setReuseContexts(contexts: string[], on: boolean) {
+    setEdits((prev) => {
+      const lower = new Set(contexts.map((c) => c.toLowerCase()));
+      const rest = prev.reuse_preset_contexts.filter(
+        (c) => !lower.has(c.toLowerCase())
+      );
+      return {
+        ...prev,
+        reuse_preset_contexts: on ? [...rest, ...contexts] : rest,
+      };
+    });
   }
 
   function commitCreateLines(key: string, lines: Line[]) {
@@ -1405,10 +1550,212 @@ function App() {
     return m;
   }, [doc]);
 
+  /**
+   * Equipment -> granted skill. Sources: a loaded mod overlay, doc.item_skills (after
+   * a data rebuild), and the item skills baked into mission units (partial but exact
+   * for the items it covers). Skill default-IF edits are applied on top.
+   */
   const itemSkillMap = useMemo(() => {
-    if (liveItemSkills) return liveItemSkills;
-    return new Map<number, ItemSkill>();
-  }, [liveItemSkills]);
+    const out = new Map<number, ItemSkill>();
+    const skillsById = new Map<number, CatalogEntry>(
+      (doc?.skills ?? []).map((x): [number, CatalogEntry] => [x.id, x])
+    );
+    const add = (itemId: number, skillId: number, if0?: number, if1?: number) => {
+      if (!(itemId > 0 && skillId > 10) || out.has(itemId)) return;
+      const sk = skillsById.get(skillId);
+      out.set(itemId, {
+        skill_id: skillId,
+        skill_symbol: sk?.symbol || "",
+        skill_name: sk?.name || sk?.symbol || "",
+        if0: Number(if0 || 0),
+        if1: Number(if1 || 0),
+      });
+    };
+    if (liveItemSkills) {
+      for (const [k, v] of liveItemSkills) out.set(k, { ...v });
+    } else {
+      for (const it of doc?.item_skills ?? [])
+        add(it.item_id, it.skill_id, it.if0, it.if1);
+      for (const m of doc?.missions ?? [])
+        for (const sq of m.squads)
+          for (const sl of sq.slots)
+            for (const ln of sl.tactics_lines ?? []) {
+              const l = ln as Line & { item_id?: number };
+              if (l.from_item && l.item_id) add(l.item_id, l.skill_id || 0, l.if0, l.if1);
+            }
+    }
+    // Skill default-IF edits apply to equipment-granted skills too.
+    const ifEdits = new Map<number, SkillIfEdit>(
+      edits.skill_default_ifs.map((e): [number, SkillIfEdit] => [e.skill_id, e])
+    );
+    if (ifEdits.size) {
+      for (const [k, v] of out)
+        out.set(k, withSkillIfEdit(v, ifEdits, (id) => ifMap.get(id)));
+    }
+    return out;
+  }, [doc, liveItemSkills, edits.skill_default_ifs, ifMap]);
+
+  /**
+   * Class default tactics WITH pending edits applied (class-slot edits from the
+   * Class defaults tab, then per-skill default-IF edits). Used for every preview.
+   * The Class defaults tab itself keeps the vanilla list as its baseline.
+   */
+  const previewClassTactics = useMemo(
+    () =>
+      overlayClassEdits(
+        liveClassTactics ?? doc?.class_tactics ?? [],
+        edits.class_tactics,
+        edits.skill_default_ifs,
+        (id) => ifMap.get(id)
+      ),
+    [doc, liveClassTactics, edits.class_tactics, edits.skill_default_ifs, ifMap]
+  );
+
+  /** Default-gear tables (CreateDefaultEquip) with Default gear tab edits applied. */
+  const equipTables = useMemo<EquipTables>(() => {
+    const classEts = new Map<number, number[]>();
+    for (const c of doc?.class_equiptypes ?? []) {
+      const bases = [0, 0, 0, 0];
+      for (const sl of c.slots) if (sl.slot >= 0 && sl.slot < 4) bases[sl.slot] = sl.equiptype_id;
+      classEts.set(c.class_id, bases);
+    }
+    for (const e of edits.class_equiptypes) {
+      const arr = Array.isArray(e.slots) ? e.slots : [];
+      classEts.set(e.class_id, [0, 1, 2, 3].map((i) => Number(arr[i] || 0)));
+    }
+    const etItems = new Map<number, [number, number, number]>();
+    const etSymbols = new Map<number, string>();
+    for (const r of doc?.equiptype_items ?? []) {
+      etItems.set(r.id, [r.item_col0_id || 0, r.item_col1_id || 0, r.item_col2_id || 0]);
+      etSymbols.set(r.id, r.symbol);
+    }
+    for (const e of edits.equiptype_items) {
+      etItems.set(e.equiptype_id, [
+        e.item_col0_id || 0,
+        e.item_col1_id || 0,
+        e.item_col2_id || 0,
+      ]);
+    }
+    return { classEts, etItems, etSymbols };
+  }, [doc, edits.class_equiptypes, edits.equiptype_items]);
+
+  /** CharaSet +0x1E tier override by CharaSet id (catalog, else seen in missions). */
+  const charaOverrideById = useMemo(() => {
+    const m = new Map<number, number>();
+    for (const mi of doc?.missions ?? [])
+      for (const sq of mi.squads)
+        for (const sl of sq.slots)
+          if (sl.charaset_id && sl.chara_param_override !== undefined)
+            m.set(sl.charaset_id, sl.chara_param_override || 0);
+    for (const c of doc?.charasets ?? [])
+      if (c.equip_param_override !== undefined) m.set(c.id, c.equip_param_override || 0);
+    return m;
+  }, [doc]);
+
+  /**
+   * Vanilla default IFs per skill + which equipment grants each skill.
+   * Sources: class default rows, doc.item_skills (after a rebuild), and the
+   * from_item tactics lines baked into mission units (partial but safe: class and
+   * item rows agree for every skill that appears in both).
+   */
+  const skillDefaultInfo = useMemo(() => {
+    const defaults = new Map<number, { if0: number; if1: number }>();
+    const itemsBySkill = new Map<number, Set<number>>();
+    const addDefault = (sid: number, i0?: number, i1?: number) => {
+      if (sid > 10 && !defaults.has(sid))
+        defaults.set(sid, { if0: Number(i0 || 0), if1: Number(i1 || 0) });
+    };
+    const addItem = (sid: number, iid: number) => {
+      if (!(sid > 10 && iid > 0)) return;
+      if (!itemsBySkill.has(sid)) itemsBySkill.set(sid, new Set());
+      itemsBySkill.get(sid)!.add(iid);
+    };
+    for (const c of doc?.class_tactics ?? [])
+      for (const ln of c.lines) addDefault(Number(ln.skill_id || 0), ln.if0, ln.if1);
+    for (const it of doc?.item_skills ?? []) {
+      addDefault(it.skill_id, it.if0, it.if1);
+      addItem(it.skill_id, it.item_id);
+    }
+    const scan = (lines?: Line[]) => {
+      for (const ln of lines ?? []) {
+        if (!ln.from_item) continue;
+        const sid = Number(ln.skill_id || 0);
+        addDefault(sid, ln.if0, ln.if1);
+        addItem(sid, Number((ln as { item_id?: number }).item_id || 0));
+      }
+    };
+    for (const m of doc?.missions ?? [])
+      for (const sq of m.squads)
+        for (const sl of sq.slots) scan(sl.tactics_lines);
+    return { defaults, itemsBySkill };
+  }, [doc]);
+
+  /** EquipAiSet row budget. The game's table has a fixed number of rows. */
+  const presetBudget = useMemo(() => {
+    const allowed = new Set(
+      edits.reuse_preset_contexts.map((c) => c.toLowerCase())
+    );
+    const groupRows = (ctxs: string[]) => {
+      const set = new Set(ctxs.map((c) => c.toLowerCase()));
+      let n = 0;
+      for (const p of doc?.equipaiset_presets ?? []) {
+        const refs = p.references ?? [];
+        if (
+          p.id &&
+          p.usage &&
+          refs.length &&
+          refs.every((r) => set.has(String(r.context || "").toLowerCase()))
+        )
+          n++;
+      }
+      return n;
+    };
+    let free = 0;
+    let reusable = 0;
+    for (const p of doc?.equipaiset_presets ?? []) {
+      if (!p.id) continue;
+      if (!p.usage) free++;
+      else {
+        const refs = p.references ?? [];
+        if (
+          refs.length &&
+          refs.every((r) => allowed.has(String(r.context || "").toLowerCase()))
+        )
+          reusable++;
+      }
+    }
+    const created = edits.equipaiset_creates.length;
+    const copies = edits.equipaiset_allocations.length;
+    const needed = created + copies;
+    const capacity = free + reusable;
+    return {
+      total: (doc?.equipaiset_presets ?? []).filter((p) => p.id).length,
+      free,
+      reusable,
+      created,
+      copies,
+      needed,
+      capacity,
+      left: capacity - needed,
+      over: Math.max(0, needed - capacity),
+      arenaRows: groupRows(ARENA_CONTEXTS),
+      overworldRows: groupRows(OVERWORLD_CONTEXTS),
+    };
+  }, [doc, edits.reuse_preset_contexts, edits.equipaiset_creates, edits.equipaiset_allocations]);
+
+  const seatLabels = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const mi of doc?.missions ?? [])
+      for (const sq of mi.squads)
+        for (const sl of sq.slots)
+          m.set(
+            `${sq.unitset_id}:${sl.slot}`,
+            `${sl.chara_name || sl.charaset_symbol || "unit"} in ${
+              mi.stage_name || mi.quest_symbol
+            }`
+          );
+    return m;
+  }, [doc]);
 
   const syntheticPresets: EquipAiPreset[] = useMemo(() => {
     return edits.equipaiset_creates.map((c) => ({
@@ -1431,6 +1778,30 @@ function App() {
         { class_id: classEntry.class_id, lines },
       ],
     }));
+  }
+
+  /** Set/clear one default-IF field of a skill. `value === undefined` clears it. */
+  function commitSkillDefaultIf(
+    skillId: number,
+    field: "if0" | "if1",
+    value: number | undefined
+  ) {
+    setEdits((prev) => {
+      const cur = prev.skill_default_ifs.find((x) => x.skill_id === skillId) || {
+        skill_id: skillId,
+      };
+      const next: Edits["skill_default_ifs"][number] = { ...cur };
+      if (value === undefined) delete next[field];
+      else next[field] = value;
+      const rest = prev.skill_default_ifs.filter((x) => x.skill_id !== skillId);
+      const empty = next.if0 === undefined && next.if1 === undefined;
+      return {
+        ...prev,
+        skill_default_ifs: empty
+          ? rest
+          : [...rest, next].sort((a, b) => a.skill_id - b.skill_id),
+      };
+    });
   }
 
   function commitEquiptypeItems(entry: EquiptypeItem, cols: [number, number, number]) {
@@ -1588,6 +1959,17 @@ function App() {
   }
 
   async function exportMod() {
+    if (
+      presetBudget.over > 0 &&
+      !window.confirm(
+        `EquipAiSet limit: ${presetBudget.needed} rows requested but only ` +
+          `${presetBudget.capacity} are available. ${presetBudget.over} preset(s)/unit ` +
+          `edit(s) will NOT be exported (units fall back to preset 0 or their ` +
+          `original preset).\n\nExport anyway?`
+      )
+    ) {
+      return;
+    }
     setExporting(true);
     setExportMsg("");
     const payload = sanitizeEditsForExport(edits);
@@ -1950,6 +2332,13 @@ function App() {
         >
           Default gear
         </button>
+        <button
+          type="button"
+          className={view === "skills" ? "active" : ""}
+          onClick={() => setView("skills")}
+        >
+          Skill conditions
+        </button>
       </nav>
 
       {view === "missions" ? <div className="layout">
@@ -2000,7 +2389,7 @@ function App() {
                 >
                   <strong>{m.stage_name || m.quest_symbol}</strong>
                   <span>
-                    {m.region} · Lv {m.enemy_level || "?"} · {m.squads.length}{" "}
+                    {missionRegion(m)} · Lv {m.enemy_level || "?"} · {m.squads.length}{" "}
                     squads
                   </span>
                 </button>
@@ -2082,8 +2471,10 @@ function App() {
                   ? edits.equipaiset_lines[String(slot.equipaiset_id)]
                   : undefined
               }
-              classTactics={effectiveClassTactics}
+              classTactics={previewClassTactics}
               itemSkills={itemSkillMap}
+              equipTables={equipTables}
+              charaOverrideById={charaOverrideById}
               ifMap={ifMap}
               skillMap={skillMap}
               sharedPreset={
@@ -2165,6 +2556,113 @@ function App() {
       ) : view === "presets" ? (
         <div className="catalog-layout">
           <aside className="panel">
+            <div className="meta-box">
+              <strong>Preset rows (EquipAiSet)</strong>
+              <p className="hint">
+                The game's preset table is fixed at {presetBudget.total} rows and
+                cannot be extended. Only{" "}
+                <strong>{presetBudget.free}</strong> are unreferenced in the base
+                game
+                {presetBudget.reusable
+                  ? `, plus ${presetBudget.reusable} you opted to reuse`
+                  : ""}
+                . Requested: <strong>{presetBudget.created}</strong> created +{" "}
+                <strong>{presetBudget.copies}</strong> per-unit copies ={" "}
+                <strong>{presetBudget.needed}</strong>
+                {presetBudget.over > 0 ? (
+                  <>
+                    {" "}
+                    →{" "}
+                    <strong style={{ color: "#c0392b" }}>
+                      over by {presetBudget.over}: these will NOT be exported
+                    </strong>
+                  </>
+                ) : (
+                  <> → {presetBudget.left} left</>
+                )}
+                .
+              </p>
+              <details>
+                <summary>Need more rows? (reuse existing presets)</summary>
+                <p className="hint">
+                  Only 13 presets are used by story-mission squads; most of the
+                  others belong to other modes. If you do not care about a mode,
+                  its presets can be overwritten to free rows. This{" "}
+                  <strong>replaces their original tactics</strong> in that mode.
+                  Off by default.
+                </p>
+                <label className="sort-row">
+                  <input
+                    type="checkbox"
+                    checked={ARENA_CONTEXTS.every((c) =>
+                      edits.reuse_preset_contexts.includes(c)
+                    )}
+                    onChange={(e) =>
+                      setReuseContexts(ARENA_CONTEXTS, e.target.checked)
+                    }
+                  />{" "}
+                  Arena / OFFLINE-only presets ({presetBudget.arenaRows} rows)
+                </label>
+                <label className="sort-row">
+                  <input
+                    type="checkbox"
+                    checked={OVERWORLD_CONTEXTS.every((c) =>
+                      edits.reuse_preset_contexts.includes(c)
+                    )}
+                    onChange={(e) =>
+                      setReuseContexts(OVERWORLD_CONTEXTS, e.target.checked)
+                    }
+                  />{" "}
+                  Overworld-only presets ({presetBudget.overworldRows} rows)
+                </label>
+                <p className="hint">
+                  Presets also used by a story mission, or that you edited or
+                  assigned, are never reused. The changelog lists every reused row.
+                </p>
+              </details>
+              <div className="row">
+                <button
+                  type="button"
+                  onClick={deleteUnassignedCreated}
+                  disabled={
+                    !edits.equipaiset_creates.some(
+                      (c) => seatsUsingCreated(c.temp_id) === 0
+                    )
+                  }
+                >
+                  Delete unassigned created (
+                  {
+                    edits.equipaiset_creates.filter(
+                      (c) => seatsUsingCreated(c.temp_id) === 0
+                    ).length
+                  }
+                  )
+                </button>
+              </div>
+              {edits.equipaiset_allocations.length > 0 && (
+                <details>
+                  <summary>
+                    Per-unit tactics copies ({edits.equipaiset_allocations.length})
+                  </summary>
+                  <ul className="list">
+                    {edits.equipaiset_allocations.map((a) => (
+                      <li key={a.key}>
+                        <span>
+                          {seatLabels.get(`${a.unitset_id}:${a.slot}`) ||
+                            `UnitSet ${a.unitset_id} slot ${a.slot + 1}`}{" "}
+                          <button
+                            type="button"
+                            onClick={() => removePrivateCopy(a.key)}
+                          >
+                            Remove
+                          </button>
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              )}
+            </div>
             <label className="sort-row">
               Mission
               <select
@@ -2185,7 +2683,7 @@ function App() {
                 {missionsByName.map((m) => (
                   <option key={m.quest_id} value={m.quest_id}>
                     {m.stage_name || m.quest_symbol}
-                    {m.region ? ` (${m.region})` : ""}
+                    {` (${missionRegion(m)})`}
                   </option>
                 ))}
               </select>
@@ -2253,6 +2751,21 @@ function App() {
             </ul>
           </aside>
           <section className="panel wide">
+            {selectedPreset && selectedPreset.id < 0 && (
+              <div className="row">
+                <button
+                  type="button"
+                  onClick={() => deleteCreatedPreset(selectedPreset.id)}
+                >
+                  Delete this created preset
+                  {seatsUsingCreated(selectedPreset.id)
+                    ? ` (used by ${seatsUsingCreated(selectedPreset.id)} seat${
+                        seatsUsingCreated(selectedPreset.id) === 1 ? "" : "s"
+                      })`
+                    : ""}
+                </button>
+              </div>
+            )}
             {selectedPreset ? (
               <PresetPanel
                 key={`${selectedPreset.id}-${editEpoch}-${loadedModPaths.join("|")}`}
@@ -2266,7 +2779,7 @@ function App() {
                 }
                 ifOptions={ifOptions}
                 skillOptions={skillOptions}
-                classTactics={effectiveClassTactics}
+                classTactics={previewClassTactics}
                 ifMap={ifMap}
                 skillMap={skillMap}
                 itemSkills={itemSkillMap}
@@ -2302,6 +2815,16 @@ function App() {
             )}
           </section>
         </div>
+      ) : view === "skills" ? (
+        <SkillConditionsView
+          skills={doc?.skills ?? []}
+          items={doc?.items ?? []}
+          skillDefaultInfo={skillDefaultInfo}
+          edits={edits.skill_default_ifs}
+          ifOptions={ifOptions}
+          ifMap={ifMap}
+          onSet={commitSkillDefaultIf}
+        />
       ) : (
         <div className="catalog-layout">
           <aside className="panel">
@@ -2429,6 +2952,198 @@ function EquiptypeItemsPanel({
           </label>
         ))}
       </div>
+    </div>
+  );
+}
+
+function SkillConditionsView({
+  skills,
+  items,
+  skillDefaultInfo,
+  edits,
+  ifOptions,
+  ifMap,
+  onSet,
+}: {
+  skills: CatalogEntry[];
+  items: CatalogEntry[];
+  skillDefaultInfo: {
+    defaults: Map<number, { if0: number; if1: number }>;
+    itemsBySkill: Map<number, Set<number>>;
+  };
+  edits: Edits["skill_default_ifs"];
+  ifOptions: ComboboxOption[];
+  ifMap: Map<number, string>;
+  onSet: (skillId: number, field: "if0" | "if1", value: number | undefined) => void;
+}) {
+  const [filter, setFilter] = useState("");
+  const [onlyGear, setOnlyGear] = useState(false);
+  const [onlyEdited, setOnlyEdited] = useState(false);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const itemName = useMemo(() => {
+    const m = new Map<number, string>();
+    for (const it of items) m.set(it.id, it.name || it.symbol || `Item ${it.id}`);
+    return m;
+  }, [items]);
+  const editBySkill = useMemo(
+    () => new Map(edits.map((e) => [e.skill_id, e])),
+    [edits]
+  );
+
+  const rows = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    return skills.filter((s) => {
+      if (s.kind === "other") return false;
+      if (onlyGear && !skillDefaultInfo.itemsBySkill.has(s.id)) return false;
+      if (onlyEdited && !editBySkill.has(s.id)) return false;
+      if (!q) return true;
+      const gear = [...(skillDefaultInfo.itemsBySkill.get(s.id) ?? [])]
+        .map((i) => itemName.get(i) || "")
+        .join(" ")
+        .toLowerCase();
+      return (
+        (s.name || "").toLowerCase().includes(q) ||
+        (s.symbol || "").toLowerCase().includes(q) ||
+        String(s.id) === q ||
+        gear.includes(q)
+      );
+    });
+  }, [skills, filter, onlyGear, onlyEdited, skillDefaultInfo, editBySkill, itemName]);
+
+  const selected =
+    skills.find((s) => s.id === selectedId) ?? rows[0] ?? null;
+
+  function field(which: "if0" | "if1", label: string) {
+    if (!selected) return null;
+    const vanilla = skillDefaultInfo.defaults.get(selected.id);
+    const edit = editBySkill.get(selected.id);
+    const edited = edit?.[which] !== undefined;
+    const vanillaVal = vanilla ? vanilla[which] : undefined;
+    const value = edited ? (edit![which] as number) : (vanillaVal ?? 0);
+    return (
+      <label>
+        {label}
+        {edited ? " *" : ""}
+        <SearchableCombobox
+          options={ifOptions}
+          value={value}
+          onChange={(id) =>
+            // Choosing the vanilla value again clears the edit.
+            onSet(selected.id, which, vanillaVal !== undefined && id === vanillaVal ? undefined : id)
+          }
+        />
+        <span className="hint">
+          {vanillaVal === undefined
+            ? "Vanilla value not in this data file — only exported if you change it."
+            : `Vanilla: ${vanillaVal ? ifMap.get(vanillaVal) || vanillaVal : "(none)"}`}
+          {edited ? (
+            <>
+              {" · "}
+              <button type="button" onClick={() => onSet(selected.id, which, undefined)}>
+                revert
+              </button>
+            </>
+          ) : null}
+        </span>
+      </label>
+    );
+  }
+
+  const gearList = selected
+    ? [...(skillDefaultInfo.itemsBySkill.get(selected.id) ?? [])]
+        .map((i) => itemName.get(i) || `Item ${i}`)
+        .sort()
+    : [];
+
+  return (
+    <div className="catalog-layout">
+      <aside className="panel">
+        <input
+          className="search"
+          placeholder="Filter skills or equipment…"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+        />
+        <label className="sort-row">
+          <input
+            type="checkbox"
+            checked={onlyGear}
+            onChange={(e) => setOnlyGear(e.target.checked)}
+          />{" "}
+          Only skills granted by equipment
+        </label>
+        <label className="sort-row">
+          <input
+            type="checkbox"
+            checked={onlyEdited}
+            onChange={(e) => setOnlyEdited(e.target.checked)}
+          />{" "}
+          Only edited
+        </label>
+        <ul className="list">
+          {rows.map((s) => (
+            <li key={s.id}>
+              <button
+                type="button"
+                className={s.id === selected?.id ? "active" : ""}
+                onClick={() => setSelectedId(s.id)}
+              >
+                <strong>
+                  {s.name || s.symbol}
+                  {editBySkill.has(s.id) ? " *" : ""}
+                </strong>
+                <span>
+                  #{s.id} · {s.kind}
+                  {skillDefaultInfo.itemsBySkill.has(s.id) ? " · gear" : ""}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      </aside>
+      <section className="panel wide">
+        {selected ? (
+          <div>
+            <h2>{selected.name || selected.symbol}</h2>
+            <p className="sub">
+              Skill {selected.id} · {selected.symbol}
+            </p>
+            <div className="meta-box">
+              <strong>Default conditions (global)</strong>
+              <p className="hint">
+                These IF0/IF1 live on the skill itself. They are the default
+                condition wherever the skill appears: class slots{" "}
+                <em>and</em> equipment that grants it. Changing one changes it for
+                every unit, player and enemy. Per-unit overrides still win (a preset
+                line, or a unit's own tactics).
+              </p>
+            </div>
+            {selected.kind === "passive" && (
+              <p className="hint">
+                Note: a passive only uses its condition if the game evaluates one for
+                it (limited/trigger passives do).
+              </p>
+            )}
+            <div className="class-lines">
+              <div className="class-line-row" style={{ gridTemplateColumns: "1fr 1fr" }}>
+                {field("if0", "Default IF0")}
+                {field("if1", "Default IF1")}
+              </div>
+            </div>
+            <h3>Granted by equipment</h3>
+            {gearList.length ? (
+              <p>{gearList.join(", ")}</p>
+            ) : (
+              <p className="hint">
+                No equipment known for this skill in the loaded data. (Rebuild the
+                data with the updated builder to list every item.)
+              </p>
+            )}
+          </div>
+        ) : (
+          <p>No skills match.</p>
+        )}
+      </section>
     </div>
   );
 }
@@ -3169,6 +3884,8 @@ function UnitPanel({
   editedPresetLines,
   classTactics,
   itemSkills,
+  equipTables,
+  charaOverrideById,
   ifMap,
   skillMap,
   sharedPreset,
@@ -3194,6 +3911,8 @@ function UnitPanel({
   editedPresetLines?: Line[];
   classTactics: ClassTactics[];
   itemSkills: Map<number, ItemSkill>;
+  equipTables: EquipTables;
+  charaOverrideById: Map<number, number>;
   ifMap: Map<number, string>;
   skillMap: Map<number, { id: number; symbol?: string; name?: string }>;
   sharedPreset: boolean;
@@ -3206,13 +3925,10 @@ function UnitPanel({
   onChangeGear: (s: Slot) => void;
   baselineGear: Gear[];
   onChangeLines: (lines: Line[]) => void;
-  onCreateEmptyPreset: () => PresetCreate;
+  onCreateEmptyPreset: () => PresetCreate | null;
   onOpenPreset: (id: number) => void;
 }) {
   const [local, setLocal] = useState(slot);
-  const [lines, setLines] = useState<Line[]>(
-    allocation?.lines ?? slot.tactics_lines
-  );
   const [pickSlot, setPickSlot] = useState<number | null>(null);
 
   // Resolve against the live unit class (after CharaSet swap), not a stale prop.
@@ -3225,8 +3941,7 @@ function UnitPanel({
 
   useEffect(() => {
     setLocal(slot);
-    setLines(allocation?.lines ?? slot.tactics_lines);
-  }, [slot, allocation]);
+  }, [slot]);
 
   useEffect(() => {
     setPickSlot(null);
@@ -3276,7 +3991,6 @@ function UnitPanel({
 
   function updateLine(i: number, patchLine: Partial<Line>) {
     const next = lines.map((x, j) => (j === i ? { ...x, ...patchLine } : x));
-    setLines(next);
     onChangeLines(next);
   }
 
@@ -3306,10 +4020,8 @@ function UnitPanel({
       source: g.item_id ? "charaset" : "empty",
     }));
     // Class defaults / resolved tactics belong to the old unit — drop them so
-    // Final tactics rebuilds from the new class (and IF edits don't show Icebolt).
-    if (local.equipaiset_id === 0 && !allocation) {
-      setLines([]);
-    }
+    // Final tactics rebuilds from the new class. The equip tier belongs to the old
+    // CharaSet too; clear it so default gear is recomputed for the new unit.
     patch({
       charaset_id: id,
       charaset_symbol: catalog.symbol,
@@ -3318,12 +4030,16 @@ function UnitPanel({
       class_symbol: catalog.class_symbol,
       gear,
       tactics_lines: [],
+      equip_param: undefined,
+      equip_param_name: undefined,
+      chara_param_override: undefined,
     });
   }
 
   function assignPreset(value: string) {
     if (value === "__create__") {
       const created = onCreateEmptyPreset();
+      if (!created) return;
       // Do not assign yet — user fills slots first
       onOpenPreset(created.temp_id);
       return;
@@ -3371,7 +4087,62 @@ function UnitPanel({
     });
   }
 
-  const gearIds = local.gear.map((g) => g.item_id).filter((id) => id > 0);
+  // ---- Equipment: explicit items + runtime CreateDefaultEquip preview --------
+  const itemNameById = useMemo(() => {
+    const m = new Map<number, string>();
+    for (const o of itemOptions) m.set(o.id, o.label);
+    return m;
+  }, [itemOptions]);
+
+  /** Tier (PARAMSET / CharaSet override) the game uses to fill empty slots. */
+  const equipTier = useMemo(() => {
+    // Baked value is exact (it includes the squad-boss quirk); it is cleared
+    // when the CharaSet is swapped, in which case it is recomputed here.
+    if (local.equip_param !== undefined) return local.equip_param;
+    const ove = charaOverrideById.get(local.charaset_id) ?? 0;
+    const bossOverride = squad.slots.some(
+      (s) =>
+        s.charaset_id > 0 &&
+        (s.slot === local.slot
+          ? ove
+          : (charaOverrideById.get(s.charaset_id) ?? s.chara_param_override ?? 0)) >= 4
+    );
+    return resolveEquipParam(
+      Number(squad.exptype) || 0,
+      Number(squad.paramset) || 0,
+      ove,
+      bossOverride
+    );
+  }, [local.equip_param, local.charaset_id, local.slot, squad, charaOverrideById]);
+
+  const gearPreview = useMemo(
+    () =>
+      local.gear.map((g, i) => {
+        // An item the CharaSet (or the user) names explicitly always wins.
+        const rom = g.rom_item_id ?? (g.source === "charaset" ? g.item_id : 0);
+        const explicit = g.edited ? g.item_id || 0 : rom || 0;
+        const fill = explicit
+          ? null
+          : resolveDefaultItem(
+              equipTables,
+              local.class_id,
+              i,
+              equipTier,
+              missionLevel,
+              local.charaset_id
+            );
+        return { explicit, fill, finalId: explicit || fill?.itemId || 0 };
+      }),
+    [local.gear, local.class_id, local.charaset_id, equipTier, missionLevel, equipTables]
+  );
+
+  // Items the unit really ends up with (drives gear-granted skills below).
+  const gearKey = gearPreview.map((x) => x.finalId).join(",");
+  const gearIds = useMemo(
+    () => gearPreview.map((x) => x.finalId).filter((id) => id > 0),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [gearKey]
+  );
   const createForUnit = creates.find((c) => c.temp_id === local.equipaiset_id);
 
   const finalResults = useMemo(() => {
@@ -3416,6 +4187,16 @@ function UnitPanel({
     [classLines, gearIds, itemSkills]
   );
 
+  // Rows of the "IF edits" section. They are built from the SAME resolved tactics
+  // as "Final tactics" (so class-default edits, gear and swapped units are
+  // included) and kept as class-slot markers where the game stores markers, so
+  // tweaking one condition does not freeze the other lines into fixed skills.
+  // Once a private copy exists, that copy is the source of truth.
+  const lines: Line[] = useMemo(
+    () => allocation?.lines ?? (toEditableLines(finalResults) as Line[]),
+    [allocation, finalResults]
+  );
+
   // Warn when a non-zero preset resolves to nothing but the unit's own class
   // skills (all markers) — it will play identically to default (id 0).
   const activePresetLines = (allocation?.lines ??
@@ -3423,12 +4204,22 @@ function UnitPanel({
     editedPresetLines ??
     presets.find((p) => p.id === local.equipaiset_id)?.lines ??
     []) as ResolveLine[];
+  const classLineByAction = new Map<number, ClassLine>(
+    classLines.map((c): [number, ClassLine] => [c.action || 0, c])
+  );
   const markerOnlyPreset =
     (local.equipaiset_id !== 0 || !!allocation) &&
     activePresetLines.length > 0 &&
-    activePresetLines.every((l) =>
-      isClassMarker((l.skill_id ?? l.action) as number)
-    );
+    activePresetLines.every((l) => {
+      const ref = (l.skill_id ?? l.action) as number;
+      if (!isClassMarker(ref)) return false;
+      // Changed conditions make it behave differently from the class default.
+      const base = classLineByAction.get(ref);
+      return (
+        !base ||
+        ((l.if0 || 0) === (base.if0 || 0) && (l.if1 || 0) === (base.if1 || 0))
+      );
+    });
   const missingExplicitCount = finalResults.filter((l) =>
     isMissingExplicit(l, classSkillIds)
   ).length;
@@ -3580,29 +4371,50 @@ function UnitPanel({
             <div className="gear-slot-row">
               <SearchableCombobox
                 options={itemOptions}
-                value={g.item_id}
-                emptyLabel="Empty"
+                value={gearPreview[i]?.finalId ?? g.item_id}
+                emptyLabel="Empty (game fills default)"
                 onChange={(id) => setGearItem(i, id)}
               />
               <button
                 type="button"
                 className="gear-clear"
-                title="Remove item from this slot"
+                title="Remove item from this slot (the game then fills its default)"
                 aria-label={`Remove item from slot ${i}`}
-                disabled={!g.item_id}
+                disabled={!gearPreview[i]?.explicit}
                 onClick={() => setGearItem(i, 0)}
               >
                 ×
               </button>
             </div>
             <span className="hint">
-              {g.source === "charaset" || (g.rom_item_id && !g.from_equiptype)
-                ? "ROM CharaSet"
-                : g.source === "createdefault" || g.from_equiptype
-                  ? "Runtime CreateDefaultEquip"
-                  : g.item_id
-                    ? ""
-                    : "Empty"}
+              {(() => {
+                const gp = gearPreview[i];
+                if (!gp) return "";
+                if (gp.explicit) {
+                  return g.edited ? "Edited" : "ROM CharaSet";
+                }
+                const f = gp.fill!;
+                const tierName = TIER_NAMES[f.tier] ?? String(f.tier);
+                if (f.itemId) {
+                  return (
+                    `Runtime CreateDefaultEquip (preview): ` +
+                    `${f.equiptypeSymbol || `EQUIPTYPE ${f.equiptypeId}`} · ` +
+                    `${tierName} tier · Lv ${missionLevel} → column ${f.column}` +
+                    (g.edited ? " · slot cleared" : "")
+                  );
+                }
+                if (f.column < 0) {
+                  return "Empty — no default for this level (needs Lv 1–50)";
+                }
+                return (
+                  `Empty — no default item for ` +
+                  `${f.equiptypeSymbol || `EQUIPTYPE ${f.equiptypeId}`} ` +
+                  `(${tierName} tier, column ${f.column})`
+                );
+              })()}
+              {gearPreview[i]?.finalId && !itemNameById.get(gearPreview[i].finalId)
+                ? ` · item ${gearPreview[i].finalId}`
+                : ""}
             </span>
           </label>
         ))}
@@ -3637,10 +4449,13 @@ function UnitPanel({
         skillMap={skillMap}
       />
 
-      <h3>IF edits (fork shared / preset 0)</h3>
+      <h3>IF edits (this unit only)</h3>
       <p className="hint">
-        Prefer editing the preset in the Presets tab. IF tweaks here allocate a
-        private copy on export when the preset is shared or is id 0.
+        Change the IF0/IF1 conditions of the lines in <em>Final tactics</em> above
+        for this unit only. When the preset is shared or is id 0, the first edit
+        gives the unit its own preset (uses one EquipAiSet row, see the Presets
+        tab). Class-slot lines stay linked to the class defaults. To change a
+        preset for everyone who uses it, edit it in the Presets tab.
       </p>
       {lines.map((ln, i) => (
         <div className={`line-row${ln.locked ? " line-locked" : ""}`} key={i}>
@@ -3684,7 +4499,7 @@ function UnitPanel({
         </div>
       ))}
       {!lines.length && (
-        <p className="hint">No baseline tactics lines for IF forking.</p>
+        <p className="hint">This unit has no tactics lines to edit.</p>
       )}
         </>
       )}

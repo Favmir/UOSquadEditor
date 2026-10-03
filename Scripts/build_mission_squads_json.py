@@ -223,6 +223,10 @@ def load_charaset_catalog(
                         "source": "empty",
                     }
                 )
+        try:
+            tier_override = int(r.get("equip_param_override") or 0)
+        except ValueError:
+            tier_override = 0
         catalog.append(
             {
                 "id": cid,
@@ -231,6 +235,9 @@ def load_charaset_catalog(
                 "class_id": class_id,
                 "class_symbol": class_symbol,
                 "class_name": class_names.get(class_id, ""),
+                # CharaSet +0x1E: beats the squad PARAMSET for default-gear tier, so
+                # the editor can preview default gear for a unit swapped into a seat.
+                "equip_param_override": tier_override,
                 "gear": gear,
             }
         )
@@ -276,11 +283,29 @@ def load_fms_skill_names() -> dict[int, str]:
     return out
 
 
+# Class default skill rows that are corrupted data (not in the original game).
+# Removed from that class ONLY: the same skills still come from equipment
+# (Beastslayer weapons) or other classes (Accelerate on FEATHER_SWORD) untouched.
+#   BLACK_KNIGHT_HG: Active Lv4 Beastslayer (145), Passive Lv4 Accelerate (332)
+CLASS_LINE_REMOVALS: dict[str, set[int]] = {
+    "BLACK_KNIGHT_HG": {145, 332},
+}
+
+
+# Wrong English condition labels in the shipped text, keyed by IF id:
+#   107 MY_HP_75PER_LOWER       JP "自身のHPが75％以下" (75% or below) shown as ">75%"
+#    95 CHARA_NUM_3_LOWER_ENEMY JP "敵が3体以下" (3 or fewer)  shown as "2 or Fewer"
+IF_LABEL_FIXES: dict[int, str] = {
+    107: "Own HP is <75%",
+    95: "3 or Fewer Enemies",
+}
+
+
 def load_fms_factor_names() -> dict[int, str]:
     """Official EN IF/condition labels from UcFactorList.fms (index == if_id)."""
     path = TABLES / "fms" / "UcFactorList.csv"
     if not path.exists():
-        return {}
+        return dict(IF_LABEL_FIXES)
     out: dict[int, str] = {}
     with path.open(encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
@@ -292,6 +317,7 @@ def load_fms_factor_names() -> dict[int, str]:
             if not name or name == "???":
                 continue
             out[fid] = name
+    out.update(IF_LABEL_FIXES)
     return out
 
 
@@ -621,6 +647,12 @@ def main() -> None:
         class_lines.setdefault(cid, []).append(entry)
 
     class_names = parse_enum(DEBUG / "_UcEnum_Class.inc", "CLASSTYPE:")
+    for _cid, _lines in list(class_lines.items()):
+        _drop = CLASS_LINE_REMOVALS.get(class_names[int(_cid)])
+        if _drop:
+            class_lines[_cid] = [
+                ln for ln in _lines if int(ln.get("skill_id") or 0) not in _drop
+            ]
     class_tactics = [
         {
             "class_id": cid,
@@ -1334,6 +1366,17 @@ def main() -> None:
         "equiptype_items": equiptype_items_catalog,
         "class_equiptypes": class_equiptypes_catalog,
         "equipaiset_presets": equipaiset_catalog,
+        # Equipment -> granted skill, with that skill's default IFs (shared with
+        # class slots). Used by the "Skill conditions" tab.
+        "item_skills": [
+            {
+                "item_id": iid,
+                "skill_id": int(m["skill_id"]),
+                "if0": int(m.get("if0") or 0),
+                "if1": int(m.get("if1") or 0),
+            }
+            for iid, m in sorted(item_skills.items())
+        ],
         "missions": sorted(missions.values(), key=lambda m: m["quest_id"]),
     }
     OUT.parent.mkdir(parents=True, exist_ok=True)

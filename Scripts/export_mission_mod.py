@@ -394,6 +394,11 @@ def main() -> None:
     ea_map: dict[str | int, int] = {}
     allocated_ids: set[int] = set()
 
+    if edits.get("reuse_preset_contexts"):
+        notes.append(
+            "WARNING: reuse_preset_contexts is only supported by the web editor's "
+            "exporter; this script ignores it and only uses unreferenced EquipAiSet rows."
+        )
     unit_edits = edits.get("unitsets", [])
     chara_edits = edits.get("charasets", [])
     tactics_overrides = dict(edits.get("equipaiset_lines") or {})
@@ -579,6 +584,7 @@ def main() -> None:
         notes.append(change)
         changes.append(change)
 
+    skill_if_writes: dict[int, dict] = {}
     for class_edit in class_edits:
         class_id = int(class_edit["class_id"])
         class_base = CLASS_SKILL_BASE + class_id * CLASS_SKILL_STRIDE
@@ -620,15 +626,13 @@ def main() -> None:
             class_words[level_off] = learn_level
             class_words[skill_off] = skill_id
 
-            # Defaults belong to the skill, not the class or unit.
+            # Defaults belong to the skill, not the class or unit. Collected and
+            # emitted once below so explicit skill_default_ifs edits can win.
             if 0 < skill_id < SKILL_TABLE_COUNT:
-                skill_row = EQUIPAISET_BASE + skill_id * EQUIPAISET_STRIDE
-                patches.append(
-                    pchtxt_word(skill_row + SKILL_DEFAULT_IF0_OFF, int(line.get("if0") or 0))
-                )
-                patches.append(
-                    pchtxt_word(skill_row + SKILL_DEFAULT_IF1_OFF, int(line.get("if1") or 0))
-                )
+                skill_if_writes[skill_id] = {
+                    "if0": int(line.get("if0") or 0),
+                    "if1": int(line.get("if1") or 0),
+                }
         for word_off, value in sorted(class_words.items()):
             patches.append(pchtxt_word(class_base + word_off, value))
         change = (
@@ -641,6 +645,38 @@ def main() -> None:
             f"  - {describe_tactics_line(line, skill_labels, if_labels)}"
             for line in lines
         )
+
+    # Explicit per-skill default conditions (shared by class slots and equipment).
+    # Only the fields present in the edit are written.
+    n_ifs = N_IFS
+    for se in edits.get("skill_default_ifs") or []:
+        sid = int(se.get("skill_id") or 0)
+        if not (0 < sid < SKILL_TABLE_COUNT):
+            notes.append(f"WARNING: skill default IF edit skips invalid skill id {sid}")
+            continue
+        cur = skill_if_writes.setdefault(sid, {})
+        parts = []
+        for key in ("if0", "if1"):
+            if se.get(key) is None:
+                continue
+            v = int(se[key])
+            v = v if 0 <= v < n_ifs else 0
+            cur[key] = v
+            name = "none" if v == 0 else if_labels.get(v, "?")
+            parts.append(f"{key.upper()}={name} ({v})")
+        change = (
+            f"Changed default condition of {skill_labels.get(sid) or f'skill {sid}'} "
+            f"({sid}): {'; '.join(parts)}"
+        )
+        notes.append(change)
+        changes.append(change)
+    for sid in sorted(skill_if_writes):
+        w = skill_if_writes[sid]
+        skill_row = EQUIPAISET_BASE + sid * EQUIPAISET_STRIDE
+        if "if0" in w:
+            patches.append(pchtxt_word(skill_row + SKILL_DEFAULT_IF0_OFF, w["if0"]))
+        if "if1" in w:
+            patches.append(pchtxt_word(skill_row + SKILL_DEFAULT_IF1_OFF, w["if1"]))
 
     for et_edit in equiptype_item_edits:
         eid = int(et_edit.get("equiptype_id") or et_edit.get("id") or 0)
