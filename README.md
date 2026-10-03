@@ -4,8 +4,11 @@ A few differences from the original tool:
 1. Now can add conditions to passives like 'Before Enemy Attacks', 'After getting debuffed', or 'Before Ally Attacks'.
 2. Now can edit skills that come with equipments.
 3. Removes the Beastslayer and Accelerate skills that were accidentally added to Doom Knight.
-4. Fixes some of the typos in the tool. Irrelevant to gameplay.
-(2 or fewer → 3 or fewer, Own HP > 75% → Own HP < 75%, Evade → Evasive Impetus, some Japanese text leftovers etc.)
+4. Fixes some of the typos in the tool. Irrelevant to gameplay. (2 or fewer → 3 or fewer, Own HP > 75% → Own HP < 75%, Evade → Evasive Impetus, some Japanese text leftovers etc.)
+5. Fixes generated default unit equipments disappearing when you change their position.
+6. Added 'Misc' category to regions list (for 'gates' that block you from going to the next area)
+7. Added warnings for having too many EquipAiSets or putting a wrong skillset on a unit.
+
 
 To run this, just download the whole thing as a ZIP, extract the .zip file somewhere, then run the **run-editor.bat** file.
 This will automatically bring up a webpage you can use to create your own mod.
