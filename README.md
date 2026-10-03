@@ -1,4 +1,5 @@
-<<<<<<< Updated upstream
+=======
+
 I made this fork to create a mod called "[Smart Enemies](https://gamebanana.com/mods/718970)".
 
 A few differences from the original tool:
@@ -16,9 +17,8 @@ A few differences from the original tool:
 To run this, just download the whole thing as a ZIP, extract the .zip file somewhere, then run the **run-editor.bat** file.
 This will automatically bring up a webpage you can use to create your own mod.
 
-
 =======
->>>>>>> Stashed changes
+
 # UO Squad Editor
 
 Unofficial fan tools for Unicorn Overlord (Ryujinx, US v1.0.5).
