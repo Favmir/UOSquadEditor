@@ -1,3 +1,16 @@
+I made this fork to create a mod called "[Smart Enemies](https://gamebanana.com/mods/718970)".
+
+A few differences from the original tool:
+1. Now can add conditions to passives like 'Before Enemy Attacks', 'After getting debuffed', or 'Before Ally Attacks'.
+2. Now can edit skills that come with equipments.
+3. Removes the Beastslayer and Accelerate skills that were accidentally added to Doom Knight.
+4. Fixes some of the typos in the tool. Irrelevant to gameplay.
+(2 or fewer → 3 or fewer, Own HP > 75% → Own HP < 75%, Evade → Evasive Impetus, some Japanese text leftovers etc.)
+
+To run this, just download the whole thing as a ZIP, extract the .zip file somewhere, then run the **run-editor.bat** file.
+This will automatically bring up a webpage you can use to create your own mod.
+
+
 # UO Squad Editor
 
 Unofficial fan tools for Unicorn Overlord (Ryujinx, US v1.0.5).
