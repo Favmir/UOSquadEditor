@@ -47,6 +47,50 @@ The global “empty slot → which item?” tables. Three columns = levels 1–1
 Most mission enemies use **`NORMAL_SWORD`**, not `DEFAULT_SWORD`. Elves’ mixed
 weapons are **`NORMAL_SWORD_M`**. `ENEMY_*` rows are unused.
 
+### Reverting a squad
+
+At the top of a unit in **Mission units**, **Revert squad…** puts the squad back to the
+original game data. You choose what to revert:
+
+- units, positions, leader flags and tactics presets (including private tactics copies);
+- the squad's own equip tier;
+- gear and tier overrides of the CharaSets it uses. These belong to the CharaSet and are
+  shared with every other squad that uses it, so they are off by default when other
+  squads would be affected, and the panel says how many.
+
+Created presets are kept (delete them in the Presets tab to free the row).
+
+### Equip tier (Normal / Power / Boss)
+
+The tier picks which Default gear band fills a unit's **empty** gear slots, so it can
+be used to give weaker units better accessories (for example the POWER band's Lapis
+Pendant). Items named in a CharaSet are never changed by it. Two controls:
+
+- **Squad equip tier (PARAMSET)**, at the top of a unit in **Mission units**: applies to
+  every unit in that squad that has no CharaSet tier override.
+- **Equip tier override**, in **CharaSet gear**: applies to every unit that uses that
+  CharaSet (and beats the squad's PARAMSET).
+
+A squad that contains a unit with a BOSS-level override gives its other NORMAL units the
+POWER band (the "boss-pack rule"). Previews, the color coding and the export changelog
+all follow your tier edits. Both fields are written as a single byte
+(`UnitSet +0x14`, `CharaSet +0x1E`). Check the result in-game.
+
+### CharaSet gear
+
+The four item ids stored in each CharaSet row (the unit templates), with a
+searchable list of every CharaSet. An empty slot is filled by the game from the
+Default gear tables, and the tab previews that for a tier and level you choose.
+
+Each CharaSet also lists the **mission units that use it** (mission, region, level,
+squad, position and tier). **Open** jumps to that unit in Mission units.
+
+Gear lives in the CharaSet itself, so many units can share one (for example the
+generic `SHAMAN_HG_F` is used by 41 seats). This game has no free CharaSet rows to
+copy a template into, so an edit applies to **every** unit using it. The tab shows how
+many units that is before and after you edit. The Gear section of a unit in
+**Mission units** edits the same data.
+
 ## Export / import
 
 **Export Ryujinx mod** downloads `<name>.zip` with `exefs/main.pchtxt` and
@@ -77,7 +121,7 @@ separately.
 | You edited | Written into `main`? |
 |------------|----------------------|
 | Who sits in a seat / which preset id | Yes |
-| That CharaSet’s four item ids | Yes (shared templates duplicated when possible) |
+| That CharaSet’s four item ids | Yes, written into the CharaSet row itself. If other seats share it, they all change: this game has no free CharaSet rows to copy it into (the unit panel and CHANGELOG warn you). |
 | Default-gear table columns | Yes |
 | A named preset’s skill list | Yes (never writes preset id 0; forks a new id instead) |
 | Class skill slots / default IFs | Yes (global) |

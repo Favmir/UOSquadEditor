@@ -1,6 +1,8 @@
 /** Browser-side Ryujinx .pchtxt export (same addresses as Scripts/export_mission_mod.py). */
 
 import { findPresetProblems } from "./presetCheck";
+import { charasetSeats } from "./charasetShare";
+import { PARAMSET_NAMES, overrideLabel } from "./defaultEquip";
 
 const NSOBID = "C841FFE2717FF03A13990480C51DA73F091C04FA";
 const UNITSET_BASE = 0x28120b8;
@@ -106,6 +108,13 @@ export type ExportEdits = {
   }[];
   class_tactics?: { class_id: number; lines?: ExportLine[] }[];
   /**
+   * UnitSet +0x14 (PARAMSET): the default-gear tier of every unit in the squad that
+   * has no CharaSet tier override. 0 NONE, 1 ZAKO, 2 NORMAL, 3 POWER, 4 BOSS.
+   */
+  squad_paramsets?: { unitset_id: number; paramset: number }[];
+  /** CharaSet +0x1E tier override (0 = none). Beats the squad's PARAMSET. */
+  charaset_tier_overrides?: { charaset_id: number; override: number }[];
+  /**
    * Opt-in: also treat existing presets as free when EVERY reference to them is in
    * one of these contexts (e.g. "Arena", "OFFLINE", "Overworld"). Their rows are
    * overwritten, so those modes lose the original preset. Default: none.
@@ -134,6 +143,8 @@ export type ExportCatalog = {
     quest_symbol?: string;
     squads?: {
       unitset_id?: number;
+      unitset_symbol?: string;
+      paramset?: number;
       slots?: {
         slot?: number;
         charaset_id?: number;
@@ -143,7 +154,7 @@ export type ExportCatalog = {
       }[];
     }[];
   }[];
-  charasets?: { id: number; class_id?: number }[];
+  charasets?: { id: number; class_id?: number; symbol?: string; name?: string }[];
   skills?: { id: number; name?: string; symbol?: string }[];
   equipai_if?: { id: number; name?: string; symbol?: string }[];
   items?: { id: number; name?: string; symbol?: string }[];
@@ -166,6 +177,16 @@ function pchtxtWord(va: number, value: number): string {
   const hex = [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]
     .map((b) => b.toString(16).padStart(2, "0").toUpperCase())
     .join("");
+  return `${va.toString(16).toUpperCase().padStart(8, "0")} ${hex}`;
+}
+
+/**
+ * One byte at `va`. Used for the tier fields: values are 0-5, and little-endian means
+ * the low byte is at the field's address whether the game stores it as u8, u16 or u32,
+ * so neighbouring fields are never touched.
+ */
+function pchtxtByte(va: number, value: number): string {
+  const hex = (value & 0xff).toString(16).padStart(2, "0").toUpperCase();
   return `${va.toString(16).toUpperCase().padStart(8, "0")} ${hex}`;
 }
 
@@ -302,14 +323,12 @@ export function buildMissionMod(
   catalog: ExportCatalog,
   modName: string
 ): { files: { path: string; text: string }[]; patchCount: number; notes: string[] } {
-  const charasetUsers = new Map<number, number>();
   const unitLabels = new Map<string, string>();
   const charasetLabels = new Map<number, string[]>();
   for (const m of catalog.missions || []) {
     for (const sq of m.squads || []) {
       for (const sl of sq.slots || []) {
         const cid = Number(sl.charaset_id || 0);
-        charasetUsers.set(cid, (charasetUsers.get(cid) || 0) + 1);
         const unitName =
           sl.chara_name || sl.charaset_symbol || `CharaSet ${cid}`;
         const stage = m.stage_name || m.quest_symbol || "unknown mission";
@@ -321,6 +340,25 @@ export function buildMissionMod(
       }
     }
   }
+  // Where a UnitSet lives ("The Battle for Hildi [OW_TK_E06_MIDBOSS_01]") and CharaSet
+  // names, so messages describe the unit actually placed (not whoever stood there before).
+  const unitsetWhere = new Map<number, string>();
+  for (const m of catalog.missions || [])
+    for (const sq of m.squads || []) {
+      const stage = m.stage_name || m.quest_symbol || "unknown mission";
+      const sym = String(sq.unitset_symbol || "").replace("UC_UNITSET_", "");
+      unitsetWhere.set(Number(sq.unitset_id || 0), sym ? `${stage} [${sym}]` : stage);
+    }
+  const charaNames = new Map<number, string>();
+  for (const c of catalog.charasets || [])
+    charaNames.set(c.id, String(c.name || c.symbol || ""));
+  const placedLabel = (uid: number, cid: number): string => {
+    const name = charaNames.get(cid) || `CharaSet ${cid}`;
+    return `${name} in ${unitsetWhere.get(uid) || `UnitSet ${uid}`}`;
+  };
+
+  const charasetSeatsNow = charasetSeats(catalog.missions || [], edits.unitsets || []);
+
   const skills = new Map(
     (catalog.skills || []).map((x) => [x.id, String(x.name || x.symbol || "")])
   );
@@ -454,6 +492,8 @@ export function buildMissionMod(
     tacticsOverrides[String(newId)] = lines;
     eaMap.set(key, newId);
     if (create.temp_id != null) eaMap.set(String(create.temp_id), newId);
+    // The row's base-game name no longer applies: it now holds this preset.
+    presetLabels.set(newId, symbol);
     const change = `Created preset ${symbol} as EquipAiSet ${newId} (source ${src}, ${lines.length} tactics slots)`;
     notes.push(change);
     changes.push(change);
@@ -475,6 +515,7 @@ export function buildMissionMod(
     allocatedIds.add(newId);
     writeTacticsRow(patches, newId, lines, notes);
     tacticsOverrides[String(newId)] = lines;
+    presetLabels.set(newId, `${presetLabels.get(src) || `EquipAiSet ${src}`} (private copy)`);
     const change = `Allocated private EquipAiSet ${src} -> ${newId} for ${unitLabel} (${lines.length} tactics slots)`;
     notes.push(change);
     changes.push(change);
@@ -521,16 +562,22 @@ export function buildMissionMod(
     const cid = Number(ce.charaset_id);
     const gear = ce.gear || [];
     if (!gear.some((g) => g.edited)) continue;
-    const shared =
-      (charasetUsers.get(cid) || 0) > 1 && ce.duplicate_if_shared !== false;
+    // Seats using this CharaSet after your seat edits (swapped-in seats count).
+    const sharers = charasetSeatsNow.get(cid) || [];
+    const shared = sharers.length > 1 && ce.duplicate_if_shared !== false;
     if (shared) {
       const sharedNames =
-        (charasetLabels.get(cid) || []).slice(0, 3).join(", ") ||
-        `CharaSet ${cid}`;
+        sharers
+          .slice(0, 3)
+          .map((r) => placedLabel(r.unitset_id, cid))
+          .join(", ") || `CharaSet ${cid}`;
       const warn =
-        `WARNING: CharaSet ${cid} is shared by ${charasetUsers.get(cid) || 0} ` +
-        `units and there are no free CharaSet rows to duplicate into. ` +
-        `Editing it in place changes gear for ALL of them (${sharedNames}).`;
+        `WARNING: CharaSet ${cid} is shared by ${sharers.length} ` +
+        `units and this game has no free CharaSet rows to copy it into ` +
+        `(the table is full; this exporter does not scan for blank rows, the ` +
+        `Python exporter confirmed there are none). ` +
+        `The gear change is written into the shared row and changes gear for ALL ` +
+        `of them (e.g. ${sharedNames}${sharers.length > 3 ? ", …" : ""}).`;
       notes.push(warn);
       changes.push(warn);
     }
@@ -614,6 +661,66 @@ export function buildMissionMod(
     notes.push(change);
     changes.push(change);
     changes.push(...lines.map((line) => `  - ${describeLine(line, skills, ifs)}`));
+  }
+
+  // ---- Equip tier: per-squad PARAMSET (UnitSet +0x14) -----------------------------
+  const basePara = new Map<number, number>();
+  for (const m of catalog.missions || [])
+    for (const sq of m.squads || [])
+      basePara.set(Number(sq.unitset_id || 0), Number(sq.paramset || 0));
+  const wrote = new Set<number>();
+  for (const e of edits.squad_paramsets || []) {
+    const uid = Number(e.unitset_id || 0);
+    const v = Number(e.paramset);
+    if (!basePara.has(uid)) {
+      notes.push(`WARNING: PARAMSET edit skipped: UnitSet ${uid} is not in the mission data`);
+      continue;
+    }
+    if (!Number.isInteger(v) || v < 0 || v > 4) {
+      notes.push(`WARNING: PARAMSET edit for UnitSet ${uid} skipped: ${e.paramset} is not 0-4`);
+      continue;
+    }
+    if (wrote.has(uid)) continue;
+    wrote.add(uid);
+    patches.push(`// PARAMSET of UnitSet ${uid}`);
+    patches.push(pchtxtByte(UNITSET_BASE + uid * UNITSET_STRIDE + 0x14, v));
+    const where = unitsetWhere.get(uid) || `UnitSet ${uid}`;
+    const was = basePara.get(uid) ?? 0;
+    const change =
+      `Set equip tier (PARAMSET) of ${where} to ${PARAMSET_NAMES[v]} (was ${PARAMSET_NAMES[was] ?? was}); ` +
+      `applies to every unit there without a CharaSet tier override`;
+    notes.push(change);
+    changes.push(change);
+  }
+
+  // ---- Equip tier: per-CharaSet override (CharaSet +0x1E) --------------------------
+  const wroteOverride = new Set<number>();
+  for (const e of edits.charaset_tier_overrides || []) {
+    const cid = Number(e.charaset_id || 0);
+    const v = Number(e.override);
+    if (cid < 2 || cid >= CHARASET_COUNT) {
+      notes.push(`WARNING: tier override skipped: CharaSet ${cid} is reserved or out of range`);
+      continue;
+    }
+    if (!Number.isInteger(v) || v < 0 || v > 5) {
+      notes.push(`WARNING: tier override for CharaSet ${cid} skipped: ${e.override} is not 0-5`);
+      continue;
+    }
+    if (wroteOverride.has(cid)) continue;
+    wroteOverride.add(cid);
+    patches.push(`// tier override of CharaSet ${cid}`);
+    patches.push(pchtxtByte(CHARASET_BASE + cid * CHARASET_STRIDE + 0x1e, v));
+    const sharers = charasetSeatsNow.get(cid) || [];
+    const name = charaNames.get(cid) || `CharaSet ${cid}`;
+    const change =
+      `Set equip tier override of ${name} (CharaSet ${cid}) to ${overrideLabel(v)}` +
+      (sharers.length > 1
+        ? `; it applies to all ${sharers.length} units that use this CharaSet`
+        : sharers.length === 1
+          ? ""
+          : "; no mission seat uses it");
+    notes.push(sharers.length > 1 ? `NOTE: ${change}` : change);
+    changes.push(change);
   }
 
   // Explicit per-skill default conditions (also what equipment-granted skills use).
@@ -732,7 +839,7 @@ export function buildMissionMod(
             checkExplicit: false,
           });
           if (bad.length) {
-            const who = unitLabels.get(`${uid}:${si}`) || `UnitSet ${uid} slot ${si}`;
+            const who = `${placedLabel(uid, cid)}, slot ${si}`;
             const msg =
               `WARNING: FREEZE RISK: ${who} (${className}) uses preset ` +
               `${presetLabels.get(eid) || "EquipAiSet"} (${eid}) which needs: ` +
@@ -745,7 +852,11 @@ export function buildMissionMod(
       patches.push(pchtxtWord(slotOff + 0x0, cid));
       patches.push(pchtxtWord(slotOff + 0x4, eid));
       patches.push(pchtxtWord(slotOff + 0x8, flags));
-      const unitLabel = unitLabels.get(`${uid}:${si}`) || `UnitSet ${uid} slot ${si}`;
+      // Cleared seats are described by who stood there; placed units by who is placed.
+      const unitLabel =
+        cid > 0
+          ? placedLabel(uid, cid)
+          : unitLabels.get(`${uid}:${si}`) || `UnitSet ${uid} slot ${si}`;
       const row = si < 3 ? "Front" : "Back";
       const col = (["Right", "Middle", "Left"] as const)[si % 3];
       const pos = `${row} ${col}`;

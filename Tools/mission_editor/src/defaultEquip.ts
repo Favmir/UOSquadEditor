@@ -121,7 +121,7 @@ export type SeatForTier = {
  * seat is unchanged (it includes the squad-boss quirk); it is undefined after the
  * CharaSet was swapped, in which case the tier is recomputed from the squad.
  */
-export function resolveSeatTier(o: {
+type SeatTierInput = {
   bakedTier?: number;
   slot: number;
   charasetId: number;
@@ -129,22 +129,39 @@ export function resolveSeatTier(o: {
   exptype?: number | string;
   paramset?: number;
   overrideById: Map<number, number>;
-}): number {
-  if (o.bakedTier !== undefined) return o.bakedTier;
-  const ove = o.overrideById.get(o.charasetId) ?? 0;
-  const bossOverride = o.seats.some(
+};
+
+/** Does another seat's BOSS-level CharaSet override put this squad in a boss pack? */
+function bossPackOf(o: SeatTierInput, ove: number): boolean {
+  return o.seats.some(
     (s) =>
       s.charaset_id > 0 &&
       (s.slot === o.slot
         ? ove
         : (o.overrideById.get(s.charaset_id) ?? s.chara_param_override ?? 0)) >= 4
   );
+}
+
+export function resolveSeatTier(o: SeatTierInput): number {
+  if (o.bakedTier !== undefined) return o.bakedTier;
+  const ove = o.overrideById.get(o.charasetId) ?? 0;
   return resolveEquipParam(
     Number(o.exptype) || 0,
     Number(o.paramset) || 0,
     ove,
-    bossOverride
+    bossPackOf(o, ove)
   );
+}
+
+/** Tier and a human explanation of where it comes from (always recomputed). */
+export function seatTierInfo(o: SeatTierInput): { tier: number; source: string } {
+  const ove = o.overrideById.get(o.charasetId) ?? 0;
+  return tierSourceOf({
+    exptype: o.exptype,
+    paramset: o.paramset,
+    charaOverride: ove,
+    bossOverride: bossPackOf(o, ove),
+  });
 }
 
 export type GearLike = {
@@ -238,4 +255,93 @@ export function topGearKind(kinds: GearKind[]): GearKind | null {
   let best: GearKind | null = null;
   for (const k of kinds) if (best === null || KIND_RANK[k] > KIND_RANK[best]) best = k;
   return best;
+}
+
+// ---------------------------------------------------------------------------
+// Tier edits: per-squad PARAMSET (UnitSet +0x14) and per-CharaSet override (+0x1E)
+// ---------------------------------------------------------------------------
+
+export const PARAMSET_NAMES: Record<number, string> = {
+  0: "NONE",
+  1: "ZAKO",
+  2: "NORMAL",
+  3: "POWER",
+  4: "BOSS",
+};
+
+/** Choices for a squad's PARAMSET. */
+export const PARAMSET_CHOICES: { value: number; label: string; help: string }[] = [
+  { value: 0, label: "NONE", help: "NORMAL band (or Default if the squad's EXPTYPE is 5+)" },
+  { value: 1, label: "ZAKO", help: "Default band (ZAKO clamps to Default)" },
+  { value: 2, label: "NORMAL", help: "Normal band" },
+  { value: 3, label: "POWER", help: "Power band" },
+  { value: 4, label: "BOSS", help: "Boss band" },
+];
+
+/** Label for a CharaSet tier override value (0 = no override). */
+export function overrideLabel(value: number): string {
+  if (!value) return "None (use the squad's PARAMSET)";
+  if (value === 1) return "Default band (ZAKO)";
+  if (value === 2) return "Normal";
+  if (value === 3) return "Power";
+  if (value === 4) return "Boss";
+  return `${value} (clamps to Default band)`;
+}
+
+type TierSeat = {
+  charaset_id: number;
+  equip_param?: number;
+  equip_param_name?: string;
+  chara_param_override?: number;
+};
+
+/**
+ * A squad with pending tier edits applied: the edited PARAMSET and the edited
+ * CharaSet overrides. The baked per-seat tier describes the unedited data, so it is
+ * cleared whenever an edit could change it (the tier is then recomputed).
+ */
+export function withTierEdits<S extends { paramset?: number; paramset_name?: string; slots: TierSeat[] }>(
+  sq: S,
+  paramsetEdit: number | undefined,
+  overrideEdits: Map<number, number>
+): S {
+  const affected =
+    paramsetEdit !== undefined || sq.slots.some((s) => s.charaset_id > 0 && overrideEdits.has(s.charaset_id));
+  if (!affected) return sq;
+  const slots = sq.slots.map((s) => {
+    const o = s.charaset_id > 0 ? overrideEdits.get(s.charaset_id) : undefined;
+    return {
+      ...s,
+      equip_param: undefined,
+      equip_param_name: undefined,
+      chara_param_override: o !== undefined ? o : s.chara_param_override,
+    };
+  });
+  return {
+    ...sq,
+    ...(paramsetEdit !== undefined
+      ? { paramset: paramsetEdit, paramset_name: PARAMSET_NAMES[paramsetEdit] ?? String(paramsetEdit) }
+      : {}),
+    slots,
+  };
+}
+
+/** Where a unit's tier comes from (for the explanation text). */
+export function tierSourceOf(o: {
+  exptype?: number | string;
+  paramset?: number;
+  charaOverride: number;
+  bossOverride: boolean;
+}): { tier: number; source: string } {
+  const tier = resolveEquipParam(
+    Number(o.exptype) || 0,
+    Number(o.paramset) || 0,
+    o.charaOverride,
+    o.bossOverride
+  );
+  if (o.charaOverride) return { tier, source: "this CharaSet's tier override" };
+  if (o.bossOverride && tier === 3 && clampEquipParam(Number(o.paramset) || 0) === 2)
+    return { tier, source: "the squad's boss-pack rule (NORMAL becomes POWER)" };
+  if (!o.paramset) return { tier, source: "the squad's PARAMSET (NONE → EXPTYPE rule)" };
+  return { tier, source: "the squad's PARAMSET" };
 }

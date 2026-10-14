@@ -71,7 +71,8 @@ h3 {
   /* mission list panel grows with the number of list columns */
   grid-template-columns:
     min(45vw, max(260px, calc(var(--list-cols, 4) * 9.5rem + 1.6rem)))
-    minmax(340px, 0.8fr)
+    /* squad list panel grows with its (up to 3) columns */
+    minmax(max(340px, calc(var(--list-cols-narrow, 2) * 8.5rem + 1.6rem)), 0.8fr)
     minmax(0, 2fr);
   gap: 0.85rem;
   min-height: 70vh;
@@ -159,7 +160,7 @@ h3 {
 .list > li {
   min-width: 0;
 }
-/* two-line items (squads) use at most 2 columns */
+/* two-line items (squads) use at most 3 columns */
 .list.list-narrow {
   grid-template-columns: repeat(var(--list-cols-narrow, 2), minmax(0, 1fr));
 }
@@ -911,7 +912,7 @@ button.linkish {
 :root {
   --gear-default: #7b8794;
   --gear-normal: #2f8f5b;
-  --gear-power: #d9822b;
+  --gear-power: #e0ac00;
   --gear-boss: #c0392b;
   --gear-custom: #7a3fb5;
   --gear-none: #b5bcc4;
@@ -950,7 +951,11 @@ button.linkish {
 }
 .gear-dot.gear-default { background: var(--gear-default); }
 .gear-dot.gear-normal { background: var(--gear-normal); }
-.gear-dot.gear-power { background: var(--gear-power); }
+.gear-dot.gear-power {
+  background: var(--gear-power);
+  /* yellow is pale on the cream background: add a thin darker rim */
+  box-shadow: 0 0 0 1px #a67c00;
+}
 .gear-dot.gear-boss { background: var(--gear-boss); }
 .gear-dot.gear-custom {
   background: var(--gear-custom);
@@ -1009,7 +1014,11 @@ button.linkish {
   background: var(--gear-default);
 }
 .gear-badge.gear-normal { background: var(--gear-normal); }
-.gear-badge.gear-power { background: var(--gear-power); }
+.gear-badge.gear-power {
+  background: var(--gear-power);
+  /* white on yellow is hard to read */
+  color: #3b2e00;
+}
 .gear-badge.gear-boss { background: var(--gear-boss); }
 .gear-badge.gear-custom { background: var(--gear-custom); }
 .gear-badge.gear-none { background: var(--gear-none); }
@@ -1025,4 +1034,50 @@ button.linkish {
 .list-cols-control button {
   padding: 0.3rem 0.6rem;
   min-width: 2rem;
+}
+
+.charaset-lines {
+  margin: 0.3rem 0 0.6rem;
+  padding-left: 1.2rem;
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.tier-box.edited {
+  border-left: 4px solid var(--gear-power);
+}
+.tier-box select {
+  margin-left: 0.3rem;
+}
+
+/* CharaSet gear: table of the mission units that use the CharaSet */
+.usage-scroll {
+  max-height: 24rem;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.usage-table th {
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+  z-index: 1;
+  box-shadow: 0 1px 0 var(--line);
+}
+.usage-table td,
+.usage-table th {
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.usage-table td:first-child {
+  white-space: normal;
+}
+
+.revert-box .row {
+  margin-bottom: 0.3rem;
+}
+.revert-box .sort-row {
+  display: block;
+  margin: 0.25rem 0;
 }

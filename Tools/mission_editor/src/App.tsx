@@ -21,12 +21,25 @@ import {
 import { buildMissionMod, SKILL_TABLE_COUNT } from "./exportMissionMod";
 import { dropPresetsFromEdits } from "./presetEdits";
 import { findPresetProblems, learnGearGrantedSkills } from "./presetCheck";
+import { charasetSeats } from "./charasetShare";
+import {
+  revertSquadEdits,
+  summarizeSquadEdits,
+  type RevertOptions,
+  type SquadEditSummary,
+} from "./squadRevert";
 import {
   GEAR_KIND_LABEL,
   gearInfoOf,
   previewSeatGear,
   resolveSeatTier,
+  seatTierInfo,
+  clampEquipParam,
   topGearKind,
+  withTierEdits,
+  overrideLabel,
+  PARAMSET_CHOICES,
+  PARAMSET_NAMES,
   TIER_NAMES,
   type EquipTables,
   type GearBand,
@@ -252,6 +265,10 @@ type Edits = {
   skill_default_ifs: { skill_id: number; if0?: number; if1?: number }[];
   /** Opt-in: contexts whose presets may be overwritten to get more EquipAiSet rows. */
   reuse_preset_contexts: string[];
+  /** Per-squad equip tier (UnitSet PARAMSET). */
+  squad_paramsets: { unitset_id: number; paramset: number }[];
+  /** Per-CharaSet equip tier override (0 = none). */
+  charaset_tier_overrides: { charaset_id: number; override: number }[];
 };
 
 /** Catch-all region for missions whose data has no region (the OW_GK_* "The Battle for …" ones). */
@@ -277,6 +294,8 @@ const EMPTY_EDITS: Edits = {
   class_equiptypes: [],
   skill_default_ifs: [],
   reuse_preset_contexts: [],
+  squad_paramsets: [],
+  charaset_tier_overrides: [],
 };
 
 function parseImportedEdits(value: unknown): Edits {
@@ -324,6 +343,10 @@ function parseImportedEdits(value: unknown): Edits {
     reuse_preset_contexts: array(
       "reuse_preset_contexts"
     ) as Edits["reuse_preset_contexts"],
+    squad_paramsets: array("squad_paramsets") as Edits["squad_paramsets"],
+    charaset_tier_overrides: array(
+      "charaset_tier_overrides"
+    ) as Edits["charaset_tier_overrides"],
   };
 }
 
@@ -607,7 +630,9 @@ function overlaySquad(
   unitSlotEdits: Map<string, SeatEdit>,
   gearEditsByCharaset: Map<number, Gear[]>,
   presetSymbolById: Map<number, string>,
-  charasetById: Map<number, CharasetCatalogEntry>
+  charasetById: Map<number, CharasetCatalogEntry>,
+  paramsetEdits: Map<number, number>,
+  overrideEdits: Map<number, number>
 ): Squad {
     const baseBySlot = new Map(rawSquad.slots.map((s) => [s.slot, s]));
     const slots: Slot[] = [];
@@ -659,8 +684,32 @@ function overlaySquad(
         slots.push(emptySlot(i));
       }
     }
-  return { ...rawSquad, slots };
+  // Pending equip-tier edits (squad PARAMSET / CharaSet overrides).
+  return withTierEdits(
+    { ...rawSquad, slots },
+    paramsetEdits.get(rawSquad.unitset_id),
+    overrideEdits
+  );
 }
+
+/** A seat that uses a CharaSet (for the CharaSet gear tab). */
+type CharasetSeatUse = {
+  unitset_id: number;
+  slot: number;
+  stage: string;
+  squad: string;
+  /** mission data, for the usage table and for jumping to the seat */
+  questId: number;
+  region: string;
+  side: string;
+  /** mission enemy level as shown in the data (0 = unknown) */
+  missionLevel: number;
+  tier?: number;
+  level: number;
+};
+
+/** A seat that uses a CharaSet, with text for the "shared CharaSet" notice. */
+type SharedSeat = { unitset_id: number; slot: number; label: string; stage: string };
 
 type SeatKind = {
   slot: number;
@@ -761,7 +810,7 @@ function App() {
     }
   }, [listCols]);
   const [view, setView] = useState<
-    "missions" | "classes" | "presets" | "equiptypes" | "skills"
+    "missions" | "classes" | "presets" | "equiptypes" | "charasets" | "skills"
   >("missions");
   const [doc, setDoc] = useState<Doc | null>(null);
   const [err, setErr] = useState<string>("");
@@ -1004,6 +1053,22 @@ function App() {
     return m;
   }, [edits.charasets]);
 
+  /** Pending equip-tier edits: squad PARAMSET and CharaSet override. */
+  const paramsetEdits = useMemo(
+    () =>
+      new Map<number, number>(
+        edits.squad_paramsets.map((e): [number, number] => [e.unitset_id, e.paramset])
+      ),
+    [edits.squad_paramsets]
+  );
+  const overrideEdits = useMemo(
+    () =>
+      new Map<number, number>(
+        edits.charaset_tier_overrides.map((e): [number, number] => [e.charaset_id, e.override])
+      ),
+    [edits.charaset_tier_overrides]
+  );
+
   const presetSymbolById = useMemo(() => {
     const m = new Map<number, string>();
     for (const p of doc?.equipaiset_presets ?? []) m.set(p.id, p.symbol);
@@ -1237,10 +1302,20 @@ function App() {
             unitSlotEdits,
             gearEditsByCharaset,
             presetSymbolById,
-            charasetById
+            charasetById,
+            paramsetEdits,
+            overrideEdits
           )
         : null,
-    [rawSquad, unitSlotEdits, gearEditsByCharaset, presetSymbolById, charasetById]
+    [
+      rawSquad,
+      unitSlotEdits,
+      gearEditsByCharaset,
+      presetSymbolById,
+      charasetById,
+      paramsetEdits,
+      overrideEdits,
+    ]
   );
 
   const slot =
@@ -1410,6 +1485,76 @@ function App() {
   }
 
   function upsertGear(next: Slot) {
+    commitCharasetGear(next.charaset_id, next.gear);
+  }
+
+  /** Put a whole squad back to the original data (see squadRevert.ts for the scope). */
+  function revertSquad(unitsetId: number, opt: RevertOptions) {
+    const orphans = squadSummary?.orphanedCreates ?? [];
+    const label = squad?.unitset_symbol.replace("UC_UNITSET_", "") ?? `UnitSet ${unitsetId}`;
+    setEdits((prev) => revertSquadEdits(prev, unitsetId, opt));
+    setExportMsg(
+      `Reverted ${label} to the original.` +
+        (opt.seats && orphans.length
+          ? ` Created preset${orphans.length === 1 ? "" : "s"} ${orphans.join(", ")} ${
+              orphans.length === 1 ? "is" : "are"
+            } now unused but still counts toward the EquipAiSet row limit; delete ${
+              orphans.length === 1 ? "it" : "them"
+            } in the Presets tab.`
+          : "")
+    );
+  }
+
+  /** Open a seat in Mission units (clears the filters that could hide it). */
+  function openSeat(seat: CharasetSeatUse) {
+    if (seat.questId < 0) return;
+    setView("missions");
+    setFilter("");
+    setRegionFilter("ALL");
+    setSideFilter(seat.side === "UNKNOWN" ? "EN" : seat.side);
+    setMissionId(seat.questId);
+    setPresetMissionId(seat.questId);
+    setSquadId(seat.unitset_id);
+    setSlotIdx(seat.slot);
+  }
+
+  /** Set a squad's equip tier (PARAMSET); null/the original value removes the edit. */
+  function commitSquadParamset(unitsetId: number, value: number | null) {
+    const base = squads.find((q) => q.unitset_id === unitsetId)?.paramset ?? 0;
+    setEdits((prev) => {
+      const rest = prev.squad_paramsets.filter((e) => e.unitset_id !== unitsetId);
+      return {
+        ...prev,
+        squad_paramsets:
+          value === null || value === base
+            ? rest
+            : [...rest, { unitset_id: unitsetId, paramset: value }].sort(
+                (a, b) => a.unitset_id - b.unitset_id
+              ),
+      };
+    });
+  }
+
+  /** Set a CharaSet's equip tier override (0 = none); null/the original removes the edit. */
+  function commitCharasetOverride(charasetId: number, value: number | null) {
+    const base = charaOverrideBase.get(charasetId);
+    setEdits((prev) => {
+      const rest = prev.charaset_tier_overrides.filter((e) => e.charaset_id !== charasetId);
+      return {
+        ...prev,
+        charaset_tier_overrides:
+          value === null || value === base
+            ? rest
+            : [...rest, { charaset_id: charasetId, override: value }].sort(
+                (a, b) => a.charaset_id - b.charaset_id
+              ),
+      };
+    });
+  }
+
+  /** Store (or drop, when nothing is edited) a CharaSet's gear override. */
+  function commitCharasetGear(charasetId: number, gearRows: Gear[]) {
+    const next = { charaset_id: charasetId, gear: gearRows };
     setEdits((prev) => {
       const charasets = prev.charasets.filter(
         (c) => c.charaset_id !== next.charaset_id
@@ -1519,6 +1664,8 @@ function App() {
       edits.equiptype_items.length > 0 ||
       edits.class_equiptypes.length > 0 ||
       edits.skill_default_ifs.length > 0 ||
+      edits.squad_paramsets.length > 0 ||
+      edits.charaset_tier_overrides.length > 0 ||
       edits.equipaiset_allocations.length > 0 ||
       edits.equipaiset_creates.length > 0 ||
       Object.keys(edits.equipaiset_lines).length > 0
@@ -1768,7 +1915,7 @@ function App() {
   }, [doc, edits.class_equiptypes, edits.equiptype_items]);
 
   /** CharaSet +0x1E tier override by CharaSet id (catalog, else seen in missions). */
-  const charaOverrideById = useMemo(() => {
+  const charaOverrideBase = useMemo(() => {
     const m = new Map<number, number>();
     for (const mi of doc?.missions ?? [])
       for (const sq of mi.squads)
@@ -1779,6 +1926,116 @@ function App() {
       if (c.equip_param_override !== undefined) m.set(c.id, c.equip_param_override || 0);
     return m;
   }, [doc]);
+  /** Overrides as they will be after your edits (what every preview uses). */
+  const charaOverrideById = useMemo(() => {
+    const m = new Map(charaOverrideBase);
+    for (const [cid, v] of overrideEdits) m.set(cid, v);
+    return m;
+  }, [charaOverrideBase, overrideEdits]);
+
+  /**
+   * CharaSets used by more than one seat (seat edits applied). Gear lives in the
+   * CharaSet row, so editing gear for one of these seats changes all of them.
+   */
+  const charasetSharing = useMemo(() => {
+    const where = new Map<number, string>();
+    for (const m of doc?.missions ?? [])
+      for (const sq of m.squads) where.set(sq.unitset_id, m.stage_name || m.quest_symbol);
+    const out = new Map<number, SharedSeat[]>();
+    for (const [cid, refs] of charasetSeats(doc?.missions ?? [], edits.unitsets)) {
+      if (refs.length < 2) continue;
+      const c = charasetById.get(cid);
+      const name = c?.name || c?.symbol || `CharaSet ${cid}`;
+      out.set(
+        cid,
+        refs.map((r): SharedSeat => {
+          const stage = where.get(r.unitset_id) ?? `UnitSet ${r.unitset_id}`;
+          return { ...r, label: `${name} in ${stage}`, stage };
+        })
+      );
+    }
+    return out;
+  }, [doc, edits.unitsets, charasetById]);
+
+  /** Every seat using each CharaSet (seat edits applied), for the CharaSet gear tab. */
+  const charasetUsage = useMemo(() => {
+    // Squads with tier edits applied, so the tier shown per seat follows your edits.
+    const squadInfo = new Map<
+      number,
+      {
+        stage: string;
+        squad: string;
+        level: number;
+        questId: number;
+        region: string;
+        side: string;
+        missionLevel: number;
+        sq: Squad;
+      }
+    >();
+    for (const m of doc?.missions ?? [])
+      for (const sq of m.squads)
+        squadInfo.set(sq.unitset_id, {
+          stage: m.stage_name || m.quest_symbol,
+          squad: sq.unitset_symbol.replace("UC_UNITSET_", ""),
+          level: Number(m.enemy_level) || 1,
+          questId: m.quest_id,
+          region: missionRegion(m),
+          side: sq.side,
+          missionLevel: Number(m.enemy_level) || 0,
+          sq: withTierEdits(sq, paramsetEdits.get(sq.unitset_id), overrideEdits),
+        });
+    const out = new Map<number, CharasetSeatUse[]>();
+    for (const [cid, refs] of charasetSeats(doc?.missions ?? [], edits.unitsets)) {
+      out.set(
+        cid,
+        refs.map((r) => {
+          const info = squadInfo.get(r.unitset_id);
+          const seat = info?.sq.slots.find((x) => x.slot === r.slot);
+          const tier = info
+            ? resolveSeatTier({
+                // the baked tier only describes the CharaSet originally in this seat
+                bakedTier: seat && seat.charaset_id === cid ? seat.equip_param : undefined,
+                slot: r.slot,
+                charasetId: cid,
+                seats: info.sq.slots,
+                exptype: info.sq.exptype,
+                paramset: info.sq.paramset,
+                overrideById: charaOverrideById,
+              })
+            : undefined;
+          return {
+            unitset_id: r.unitset_id,
+            slot: r.slot,
+            stage: info?.stage ?? `UnitSet ${r.unitset_id}`,
+            squad: info?.squad ?? "",
+            questId: info?.questId ?? -1,
+            region: info?.region ?? MISC_REGION,
+            side: info?.side ?? "EN",
+            missionLevel: info?.missionLevel ?? 0,
+            tier,
+            level: info?.level ?? 1,
+          };
+        })
+      );
+    }
+    return out;
+  }, [doc, edits.unitsets, paramsetEdits, overrideEdits, charaOverrideById]);
+
+  /** What was edited in the selected squad, for the "Revert squad" panel. */
+  const squadSummary = useMemo<SquadEditSummary | null>(() => {
+    if (!rawSquad || !squad) return null;
+    const ids: number[] = [];
+    for (const x of rawSquad.slots) if (x.charaset_id > 0) ids.push(x.charaset_id);
+    for (const x of squad.slots) if (x.charaset_id > 0) ids.push(x.charaset_id);
+    return summarizeSquadEdits({
+      unitsetId: squad.unitset_id,
+      edits,
+      charasetIds: ids,
+      usage: charasetUsage,
+      charasetName: (id) => charasetById.get(id)?.symbol || `CharaSet ${id}`,
+    });
+  }, [rawSquad, squad, edits, charasetUsage, charasetById]);
 
   /** Per-squad default-gear kinds for the squad list (edits applied). */
   const squadKinds = useMemo(() => {
@@ -1789,7 +2046,15 @@ function App() {
       out.set(
         sq.unitset_id,
         squadGearKinds(
-          overlaySquad(sq, unitSlotEdits, gearEditsByCharaset, presetSymbolById, charasetById),
+          overlaySquad(
+            sq,
+            unitSlotEdits,
+            gearEditsByCharaset,
+            presetSymbolById,
+            charasetById,
+            paramsetEdits,
+            overrideEdits
+          ),
           level,
           equipTables,
           charaOverrideById
@@ -1803,6 +2068,8 @@ function App() {
     gearEditsByCharaset,
     presetSymbolById,
     charasetById,
+    paramsetEdits,
+    overrideEdits,
     equipTables,
     charaOverrideById,
   ]);
@@ -2416,8 +2683,8 @@ function App() {
       style={
         {
           "--list-cols": listCols,
-          // two-line items (squads) get at most 2 columns so they stay readable
-          "--list-cols-narrow": Math.min(listCols, 2),
+          // two-line items (squads) get at most 3 columns so they stay readable
+          "--list-cols-narrow": Math.min(listCols, 3),
         } as CSSProperties
       }
     >
@@ -2525,6 +2792,13 @@ function App() {
           onClick={() => setView("equiptypes")}
         >
           Default gear
+        </button>
+        <button
+          type="button"
+          className={view === "charasets" ? "active" : ""}
+          onClick={() => setView("charasets")}
+        >
+          CharaSet gear
         </button>
         <button
           type="button"
@@ -2655,15 +2929,19 @@ function App() {
                     ]
                       .filter(Boolean)
                       .join(" ")}
-                    title={summary ? `Gear: ${summary}` : undefined}
+                    title={`${kinds.length} unit${kinds.length === 1 ? "" : "s"}${
+                      summary ? ` · Gear: ${summary}` : ""
+                    }`}
                     onClick={() => setSquadId(s.unitset_id)}
                   >
                     <strong>{breakable(s.unitset_symbol.replace("UC_UNITSET_", ""))}</strong>
                     <span>
                       {s.side}
-                      {s.paramset_name ? ` · ${s.paramset_name}` : ""}
-                      {" · "}
-                      {s.slots.filter((sl) => sl.charaset_id > 0).length} units
+                      {paramsetEdits.has(s.unitset_id)
+                        ? ` · ${PARAMSET_NAMES[paramsetEdits.get(s.unitset_id) ?? 0] ?? "?"} *`
+                        : s.paramset_name
+                          ? ` · ${s.paramset_name}`
+                          : ""}
                     </span>
                     {kinds.length > 0 && (
                       <span className="gear-dots">
@@ -2710,6 +2988,11 @@ function App() {
               charaOverrideById={charaOverrideById}
               gearSkillHint={gearSkillHint}
               seatKinds={squadKinds.get(squad.unitset_id) ?? []}
+              charasetSharing={charasetSharing}
+              baseParamset={rawSquad?.paramset ?? 0}
+              onChangeParamset={(v) => commitSquadParamset(squad.unitset_id, v)}
+              squadSummary={squadSummary}
+              onRevertSquad={(opt) => revertSquad(squad.unitset_id, opt)}
               ifMap={ifMap}
               skillMap={skillMap}
               sharedPreset={
@@ -3058,6 +3341,19 @@ function App() {
             )}
           </section>
         </div>
+      ) : view === "charasets" ? (
+        <CharasetGearView
+          charasets={doc?.charasets ?? []}
+          gearEdits={gearEditsByCharaset}
+          itemOptions={itemOptions}
+          usage={charasetUsage}
+          equipTables={equipTables}
+          overrideBase={charaOverrideBase}
+          overrideEdits={overrideEdits}
+          onCommit={commitCharasetGear}
+          onOverride={commitCharasetOverride}
+          onOpenSeat={openSeat}
+        />
       ) : view === "skills" ? (
         <SkillConditionsView
           skills={doc?.skills ?? []}
@@ -3203,6 +3499,509 @@ function EquiptypeItemsPanel({
           </label>
         ))}
       </div>
+    </div>
+  );
+}
+
+/** Edit the four gear item ids stored in CharaSet rows (the unit templates). */
+function CharasetGearView({
+  charasets,
+  gearEdits,
+  itemOptions,
+  usage,
+  equipTables,
+  overrideBase,
+  overrideEdits,
+  onCommit,
+  onOverride,
+  onOpenSeat,
+}: {
+  charasets: CharasetCatalogEntry[];
+  gearEdits: Map<number, Gear[]>;
+  itemOptions: ComboboxOption[];
+  usage: Map<number, CharasetSeatUse[]>;
+  equipTables: EquipTables;
+  /** tier override in the game data, and the user's pending edits */
+  overrideBase: Map<number, number>;
+  overrideEdits: Map<number, number>;
+  onCommit: (charasetId: number, gear: Gear[]) => void;
+  onOverride: (charasetId: number, value: number | null) => void;
+  onOpenSeat: (seat: CharasetSeatUse) => void;
+}) {
+  const [filter, setFilter] = useState("");
+  const [classFilter, setClassFilter] = useState("ALL");
+  const [onlyEdited, setOnlyEdited] = useState(false);
+  const [onlyUsed, setOnlyUsed] = useState(false);
+  const [sortBy, setSortBy] = useState<"id" | "used">("id");
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+
+  // Rows 0 and 1 are reserved sentinels the exporter refuses to write.
+  const editable = useMemo(() => charasets.filter((c) => c.id >= 2), [charasets]);
+  const classes = useMemo(
+    () => [...new Set(editable.map((c) => c.class_symbol).filter(Boolean))].sort(),
+    [editable]
+  );
+  const seatCount = (id: number) => usage.get(id)?.length ?? 0;
+
+  const rows = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    const out = editable.filter((c) => {
+      if (classFilter !== "ALL" && c.class_symbol !== classFilter) return false;
+      if (onlyEdited && !gearEdits.has(c.id) && !overrideEdits.has(c.id)) return false;
+      if (onlyUsed && !(usage.get(c.id)?.length ?? 0)) return false;
+      if (!q) return true;
+      return (
+        (c.symbol || "").toLowerCase().includes(q) ||
+        (c.name || "").toLowerCase().includes(q) ||
+        (c.class_symbol || "").toLowerCase().includes(q) ||
+        String(c.id) === q
+      );
+    });
+    if (sortBy === "used")
+      out.sort(
+        (a, b) => (usage.get(b.id)?.length ?? 0) - (usage.get(a.id)?.length ?? 0) || a.id - b.id
+      );
+    return out;
+  }, [editable, filter, classFilter, onlyEdited, onlyUsed, sortBy, gearEdits, overrideEdits, usage]);
+
+  const selected = editable.find((c) => c.id === selectedId) ?? rows[0] ?? null;
+
+  return (
+    <div className="catalog-layout">
+      <aside className="panel">
+        <input
+          className="search"
+          placeholder="Filter by name, symbol, class or id…"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+        />
+        <label className="sort-row">
+          Class
+          <select value={classFilter} onChange={(e) => setClassFilter(e.target.value)}>
+            <option value="ALL">All classes</option>
+            {classes.map((c) => (
+              <option key={c} value={c}>
+                {c}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="sort-row">
+          Sort
+          <select value={sortBy} onChange={(e) => setSortBy(e.target.value as "id" | "used")}>
+            <option value="id">By id</option>
+            <option value="used">Most used first</option>
+          </select>
+        </label>
+        <label className="sort-row">
+          <input type="checkbox" checked={onlyUsed} onChange={(e) => setOnlyUsed(e.target.checked)} />{" "}
+          Only CharaSets used by a mission seat
+        </label>
+        <label className="sort-row">
+          <input
+            type="checkbox"
+            checked={onlyEdited}
+            onChange={(e) => setOnlyEdited(e.target.checked)}
+          />{" "}
+          Only edited
+        </label>
+        <p className="hint">{rows.length} of {editable.length} CharaSets</p>
+        <ul className="list">
+          {rows.map((c) => {
+            const n = seatCount(c.id);
+            return (
+              <li key={c.id}>
+                <button
+                  type="button"
+                  className={c.id === selected?.id ? "active" : ""}
+                  title={`${c.symbol} (#${c.id}) · ${c.class_symbol} · ${n} seat${n === 1 ? "" : "s"}`}
+                  onClick={() => setSelectedId(c.id)}
+                >
+                  <strong>
+                    {breakable(c.symbol || `CharaSet ${c.id}`)}
+                    {gearEdits.has(c.id) || overrideEdits.has(c.id) ? " *" : ""}
+                  </strong>
+                  <span>
+                    #{c.id} · {n} seat{n === 1 ? "" : "s"} · {c.class_symbol}
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      </aside>
+      <section className="panel wide">
+        {selected ? (
+          <CharasetGearEditor
+            key={selected.id}
+            entry={selected}
+            gearRows={gearEdits.get(selected.id) ?? catalogGearRows(selected)}
+            isEdited={gearEdits.has(selected.id)}
+            seats={usage.get(selected.id) ?? []}
+            itemOptions={itemOptions}
+            equipTables={equipTables}
+            tierBase={overrideBase.get(selected.id)}
+            tierEdited={overrideEdits.get(selected.id)}
+            onChangeOverride={(v) => onOverride(selected.id, v)}
+            onOpenSeat={onOpenSeat}
+            onCommit={onCommit}
+          />
+        ) : (
+          <p>No CharaSets match.</p>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function CharasetGearEditor({
+  entry,
+  gearRows,
+  isEdited,
+  seats,
+  itemOptions,
+  equipTables,
+  tierBase,
+  tierEdited,
+  onChangeOverride,
+  onOpenSeat,
+  onCommit,
+}: {
+  entry: CharasetCatalogEntry;
+  gearRows: Gear[];
+  isEdited: boolean;
+  seats: CharasetSeatUse[];
+  itemOptions: ComboboxOption[];
+  equipTables: EquipTables;
+  /** tier override in the data (undefined = unknown) and the pending edit */
+  tierBase: number | undefined;
+  tierEdited: number | undefined;
+  onChangeOverride: (value: number | null) => void;
+  onOpenSeat: (seat: CharasetSeatUse) => void;
+  onCommit: (charasetId: number, gear: Gear[]) => void;
+}) {
+  // Preview inputs start from how the mission seats using this CharaSet are set up.
+  const mode = (values: number[], fallback: number) => {
+    const counts = new Map<number, number>();
+    for (const v of values) counts.set(v, (counts.get(v) ?? 0) + 1);
+    let best = fallback;
+    let bestN = 0;
+    for (const [v, n] of counts) if (n > bestN) [best, bestN] = [v, n];
+    return best;
+  };
+  const seatTier = mode(seats.map((x) => x.tier).filter((t): t is number => t !== undefined), 2);
+  const effectiveOverride = tierEdited ?? tierBase ?? 0;
+  // A CharaSet override beats the squad's tier, so the preview follows it.
+  const autoTier = effectiveOverride > 0 ? clampEquipParam(effectiveOverride) : seatTier;
+  const [tierManual, setTierManual] = useState<number | null>(null);
+  const tier = tierManual ?? autoTier;
+  const tierIsEdited = tierEdited !== undefined;
+  const [level, setLevel] = useState<number>(mode(seats.map((x) => x.level), 10));
+
+  const itemName = useMemo(() => {
+    const m = new Map<number, string>();
+    for (const o of itemOptions) m.set(o.id, o.label);
+    return m;
+  }, [itemOptions]);
+  const romBase = useMemo(() => catalogGearRows(entry), [entry]);
+
+  const preview = useMemo(
+    () => previewSeatGear(gearRows, equipTables, entry.class_id, tier, level, entry.id),
+    [gearRows, equipTables, entry.class_id, entry.id, tier, level]
+  );
+  const slotType = (i: number) => {
+    const et = equipTables.classEts.get(entry.class_id)?.[i] ?? 0;
+    const sym = equipTables.etSymbols.get(et) || (et === 0 ? "NONE" : `type ${et}`);
+    return sym.replace(/^DEFAULT_/, "");
+  };
+
+  function setSlot(i: number, itemId: number) {
+    const meta = itemOptions.find((o) => o.id === itemId);
+    onCommit(
+      entry.id,
+      gearRows.map((g, j) =>
+        j === i
+          ? {
+              ...g,
+              item_id: itemId,
+              item_symbol: meta?.secondary || "",
+              item_name: meta?.label || "",
+              source: "edit",
+              edited: true,
+              from_equiptype: undefined,
+              equiptype_param_name: undefined,
+            }
+          : g
+      )
+    );
+  }
+  function revertSlot(i: number) {
+    onCommit(
+      entry.id,
+      gearRows.map((g, j) => (j === i ? { ...romBase[i], edited: false } : g))
+    );
+  }
+  function restoreAll() {
+    onCommit(entry.id, romBase);
+  }
+
+  const sortedSeats = useMemo(
+    () =>
+      [...seats].sort(
+        (a, b) =>
+          a.region.localeCompare(b.region) ||
+          a.missionLevel - b.missionLevel ||
+          a.stage.localeCompare(b.stage) ||
+          a.squad.localeCompare(b.squad) ||
+          a.slot - b.slot
+      ),
+    [seats]
+  );
+  const usageSummary = useMemo(() => {
+    const byRegion = new Map<string, number>();
+    for (const x of seats) byRegion.set(x.region, (byRegion.get(x.region) ?? 0) + 1);
+    const regions = [...byRegion]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([r, n]) => `${r} ${n}`)
+      .join(" · ");
+    const lv = seats.map((x) => x.missionLevel).filter((n) => n > 0);
+    const levels = lv.length
+      ? Math.min(...lv) === Math.max(...lv)
+        ? `Lv ${Math.min(...lv)}`
+        : `Lv ${Math.min(...lv)}–${Math.max(...lv)}`
+      : "level unknown";
+    return `By region: ${regions}. Levels: ${levels}.`;
+  }, [seats]);
+
+  const others = seats.length;
+  const stages = new Set(seats.map((x) => x.stage)).size;
+  const sampleSeats = seats
+    .slice(0, 3)
+    .map((x) => `${x.stage} (${x.squad})`)
+    .join(", ");
+
+  return (
+    <div>
+      <div className="row">
+        <h2>{entry.symbol}</h2>
+        <button type="button" disabled={!isEdited} onClick={restoreAll} title="Revert all four slots to the ROM values">
+          Restore ROM gear
+        </button>
+      </div>
+      <p className="sub">
+        CharaSet {entry.id} · {entry.class_symbol}
+        {entry.name && entry.name !== "Blank" ? ` · ${entry.name}` : ""}
+        {isEdited ? " · edited" : ""}
+      </p>
+
+      {others > 1 ? (
+        <div
+          className={isEdited || tierIsEdited ? "danger-box" : "warn-box"}
+          role={isEdited || tierIsEdited ? "alert" : undefined}
+        >
+          <strong>
+            {isEdited || tierIsEdited
+              ? `⛔ Your edits change ${others} units`
+              : `⚠ ${others} units share this CharaSet`}
+          </strong>
+          <p>
+            Used by {others} units in {stages} mission{stages === 1 ? "" : "s"} (e.g. {sampleSeats}
+            {others > 3 ? ", …" : ""}). Gear and the tier override are stored in the CharaSet itself
+            and this game has no free CharaSet row to copy it into, so a change here applies to every
+            one of them.
+          </p>
+          <p>
+            To change only one unit, swap that unit to a CharaSet fewer seats use (Mission units tab).
+            To change a whole tier, edit the Default gear tab instead.
+          </p>
+        </div>
+      ) : others === 1 ? (
+        <p className="hint">Used by 1 unit: {sampleSeats}. Edits only affect that unit.</p>
+      ) : (
+        <p className="hint">
+          No mission seat uses this CharaSet. Other game content (e.g. the Arena) may still use it.
+        </p>
+      )}
+
+      <h3>Equip tier override</h3>
+      <div className="row" style={{ justifyContent: "flex-start", gap: "1rem" }}>
+        <label>
+          <select
+            value={tierEdited ?? tierBase ?? -1}
+            onChange={(e) => {
+              const v = Number(e.target.value);
+              onChangeOverride(v < 0 ? null : v);
+              setTierManual(null);
+            }}
+          >
+            {tierBase === undefined && tierEdited === undefined && (
+              <option value={-1}>Not changed (unknown in this data)</option>
+            )}
+            {[0, 1, 2, 3, 4].map((v) => (
+              <option key={v} value={v}>
+                {overrideLabel(v)}
+              </option>
+            ))}
+            {(tierEdited === 5 || tierBase === 5) && <option value={5}>{overrideLabel(5)}</option>}
+          </select>
+        </label>
+        <button
+          type="button"
+          disabled={!tierIsEdited}
+          onClick={() => {
+            onChangeOverride(null);
+            setTierManual(null);
+          }}
+        >
+          {tierIsEdited
+            ? `Revert${tierBase !== undefined ? ` (was ${overrideLabel(tierBase)})` : ""}`
+            : "Unchanged"}
+        </button>
+      </div>
+      <p className="hint">
+        A non-zero override beats the squad's PARAMSET for every unit using this CharaSet, and picks
+        which default-gear band fills its empty slots (Normal / Power / Boss bands in the Default gear
+        tab). Items named in the CharaSet are never changed by it.
+      </p>
+
+      <h3>Gear (CharaSet row)</h3>
+      <p className="hint">
+        These are the item ids written into the CharaSet. An empty slot is filled by the game from the
+        Default gear tables (see the preview below).
+      </p>
+      <div className="gear-grid">
+        {gearRows.map((g, i) => {
+          const gp = preview[i];
+          const rom = romBase[i]?.item_id || 0;
+          const edited = Boolean(g.edited);
+          return (
+            <label key={i}>
+              Slot {i} · {slotType(i)}
+              {edited ? " *" : ""}
+              <div className="gear-slot-row">
+                <SearchableCombobox
+                  options={itemOptions}
+                  value={gp?.explicit ?? 0}
+                  emptyLabel="Empty (game fills default)"
+                  onChange={(id) => setSlot(i, id)}
+                />
+                <button
+                  type="button"
+                  className="gear-clear"
+                  title="Revert this slot to its ROM value"
+                  aria-label={`Revert slot ${i}`}
+                  disabled={!edited}
+                  onClick={() => revertSlot(i)}
+                >
+                  ↺
+                </button>
+              </div>
+              <span className="hint">
+                {edited
+                  ? `Edited · ROM: ${rom ? itemName.get(rom) || `item ${rom}` : "empty"}`
+                  : rom
+                    ? "ROM value"
+                    : "Empty in ROM"}
+              </span>
+            </label>
+          );
+        })}
+      </div>
+
+      <h3>What the unit actually wears (preview)</h3>
+      <div className="row" style={{ justifyContent: "flex-start", gap: "1.2rem" }}>
+        <label>
+          Tier{" "}
+          <select value={tier} onChange={(e) => setTierManual(Number(e.target.value))}>
+            <option value={0}>Default</option>
+            <option value={2}>Normal</option>
+            <option value={3}>Power</option>
+            <option value={4}>Boss</option>
+          </select>
+        </label>
+        <label>
+          Level{" "}
+          <input
+            type="number"
+            min={1}
+            max={50}
+            value={level}
+            onChange={(e) => setLevel(Math.max(1, Math.min(50, Number(e.target.value) || 1)))}
+            style={{ width: "4.5rem" }}
+          />
+        </label>
+      </div>
+      <p className="hint">
+        {effectiveOverride > 0
+          ? "The tier follows this CharaSet's tier override. "
+          : `Starts from the most common tier of the ${seats.length} seat${seats.length === 1 ? "" : "s"} using this CharaSet. `}
+        The level starts from the most common mission level; change either to see other cases.
+      </p>
+      <ul className="charaset-lines">
+        {preview.map((p, i) => (
+          <li key={i}>
+            <strong>Slot {i}</strong> ({slotType(i)}):{" "}
+            {p.explicit
+              ? `${itemName.get(p.explicit) || `item ${p.explicit}`} (named in this CharaSet)`
+              : p.fill && p.fill.itemId
+                ? `${itemName.get(p.fill.itemId) || `item ${p.fill.itemId}`} (default: ${
+                    p.fill.equiptypeSymbol || `EQUIPTYPE ${p.fill.equiptypeId}`
+                  }, column ${p.fill.column})`
+                : "empty (no default item for this tier/level)"}
+          </li>
+        ))}
+      </ul>
+
+      <h3>
+        Mission units using this CharaSet ({seats.length})
+      </h3>
+      {seats.length === 0 ? (
+        <p className="hint">No mission seat uses this CharaSet.</p>
+      ) : (
+        <>
+          <p className="hint">
+            {usageSummary}
+            {" "}Sorted by region, then level.
+          </p>
+          <div className="usage-scroll">
+            <table className="tactics-table usage-table">
+              <thead>
+                <tr>
+                  <th>Mission</th>
+                  <th>Region</th>
+                  <th>Lv</th>
+                  <th>Squad</th>
+                  <th>Position</th>
+                  <th>Tier</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {sortedSeats.map((x) => (
+                  <tr key={`${x.unitset_id}:${x.slot}`}>
+                    <td>{x.stage}</td>
+                    <td>{x.region}</td>
+                    <td>{x.missionLevel || "?"}</td>
+                    <td>{breakable(x.squad)}</td>
+                    <td>{formationLabel(x.slot)}</td>
+                    <td>{x.tier !== undefined ? TIER_NAMES[x.tier] ?? x.tier : "—"}</td>
+                    <td>
+                      <button
+                        type="button"
+                        className="linkish"
+                        onClick={() => onOpenSeat(x)}
+                        title="Open this unit in Mission units"
+                      >
+                        Open
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -4035,6 +4834,206 @@ function PresetPanel({
   );
 }
 
+/** "Revert squad" with a choice of what to put back (CharaSet edits are shared). */
+function SquadRevertPanel({
+  summary,
+  onRevert,
+}: {
+  summary: SquadEditSummary | null;
+  onRevert: (opt: RevertOptions) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const sharedGear = summary?.gear.some((g) => g.otherSquads > 0) ?? false;
+  const sharedTier = summary?.tiers.some((g) => g.otherSquads > 0) ?? false;
+  // Safe by default: CharaSet edits only if no other squad is affected by dropping them.
+  const [seats, setSeats] = useState(true);
+  const [paramset, setParamset] = useState(true);
+  const [gear, setGear] = useState(!sharedGear);
+  const [tiers, setTiers] = useState(!sharedTier);
+  if (!summary) return null;
+
+  const seatCount = summary.seatEdits + summary.tacticsCopies;
+  const anything =
+    summary.hasSquadEdits || summary.gear.length > 0 || summary.tiers.length > 0;
+  const names = (list: { name: string }[]) =>
+    list
+      .slice(0, 3)
+      .map((x) => x.name)
+      .join(", ") + (list.length > 3 ? ", …" : "");
+  const shared = (list: { otherSquads: number }[]) => {
+    const n = Math.max(0, ...list.map((x) => x.otherSquads));
+    return n > 0 ? ` — also used by other squads (up to ${n}); reverting changes them too` : "";
+  };
+  const chosen =
+    (seats && seatCount > 0) ||
+    (paramset && summary.paramsetEdited) ||
+    (gear && summary.gear.length > 0) ||
+    (tiers && summary.tiers.length > 0);
+
+  return (
+    <div className="meta-box revert-box">
+      <div className="row">
+        <span>
+          {summary.hasSquadEdits
+            ? `This squad has edits (${[
+                summary.seatEdits ? `${summary.seatEdits} seat${summary.seatEdits === 1 ? "" : "s"}` : "",
+                summary.tacticsCopies
+                  ? `${summary.tacticsCopies} tactics cop${summary.tacticsCopies === 1 ? "y" : "ies"}`
+                  : "",
+                summary.paramsetEdited ? "equip tier" : "",
+              ]
+                .filter(Boolean)
+                .join(", ")}).`
+            : anything
+              ? "No squad edits. Some of its CharaSets have gear or tier edits."
+              : "This squad matches the original data."}
+        </span>
+        <button
+          type="button"
+          disabled={!anything}
+          onClick={() => setOpen((v) => !v)}
+          title="Put this squad back to the original data, including unit positions"
+        >
+          {open ? "Close" : "Revert squad…"}
+        </button>
+      </div>
+      {open && anything && (
+        <div>
+          <label className="sort-row">
+            <input
+              type="checkbox"
+              checked={seats && seatCount > 0}
+              disabled={seatCount === 0}
+              onChange={(e) => setSeats(e.target.checked)}
+            />{" "}
+            Units, positions, leader flags and tactics presets ({seatCount} edit
+            {seatCount === 1 ? "" : "s"})
+          </label>
+          <label className="sort-row">
+            <input
+              type="checkbox"
+              checked={paramset && summary.paramsetEdited}
+              disabled={!summary.paramsetEdited}
+              onChange={(e) => setParamset(e.target.checked)}
+            />{" "}
+            Squad equip tier (PARAMSET)
+          </label>
+          <label className="sort-row">
+            <input
+              type="checkbox"
+              checked={gear && summary.gear.length > 0}
+              disabled={summary.gear.length === 0}
+              onChange={(e) => setGear(e.target.checked)}
+            />{" "}
+            Gear of CharaSets used here: {summary.gear.length ? names(summary.gear) : "no edits"}
+            {shared(summary.gear)}
+          </label>
+          <label className="sort-row">
+            <input
+              type="checkbox"
+              checked={tiers && summary.tiers.length > 0}
+              disabled={summary.tiers.length === 0}
+              onChange={(e) => setTiers(e.target.checked)}
+            />{" "}
+            Tier override of CharaSets used here:{" "}
+            {summary.tiers.length ? names(summary.tiers) : "no edits"}
+            {shared(summary.tiers)}
+          </label>
+          {summary.orphanedCreates.length > 0 && seats && (
+            <p className="hint">
+              Created preset{summary.orphanedCreates.length === 1 ? "" : "s"}{" "}
+              {summary.orphanedCreates.join(", ")} stay in the project (delete them in the Presets
+              tab to free the row).
+            </p>
+          )}
+          <div className="row" style={{ justifyContent: "flex-start", gap: "0.6rem" }}>
+            <button
+              type="button"
+              disabled={!chosen}
+              onClick={() => {
+                onRevert({
+                  seats: seats && seatCount > 0,
+                  paramset: paramset && summary.paramsetEdited,
+                  gearIds: gear ? summary.gear.map((g) => g.charasetId) : [],
+                  tierIds: tiers ? summary.tiers.map((g) => g.charasetId) : [],
+                });
+                setOpen(false);
+              }}
+            >
+              Revert selected
+            </button>
+            <button type="button" onClick={() => setOpen(false)}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Squad-level equip tier (UnitSet PARAMSET) selector. */
+function SquadTierControl({
+  value,
+  baseValue,
+  units,
+  withOverride,
+  bossPack,
+  onChange,
+}: {
+  value: number;
+  baseValue: number;
+  units: number;
+  withOverride: number;
+  /** a unit in this squad has a BOSS-level CharaSet tier override */
+  bossPack: boolean;
+  onChange: (value: number | null) => void;
+}) {
+  const edited = value !== baseValue;
+  const help = PARAMSET_CHOICES.find((c) => c.value === value)?.help ?? "";
+  const affected = Math.max(0, units - withOverride);
+  return (
+    <div className={`meta-box tier-box${edited ? " edited" : ""}`}>
+      <div className="row">
+        <label>
+          <strong>Squad equip tier (PARAMSET)</strong>{" "}
+          <select
+            value={value}
+            onChange={(e) => onChange(Number(e.target.value))}
+            title="Which default-gear band fills the empty gear slots of this squad's units"
+          >
+            {PARAMSET_CHOICES.map((c) => (
+              <option key={c.value} value={c.value}>
+                {c.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button
+          type="button"
+          disabled={!edited}
+          onClick={() => onChange(null)}
+          title="Back to the value in the game data"
+        >
+          {edited ? `Revert (was ${PARAMSET_NAMES[baseValue] ?? baseValue})` : "Unchanged"}
+        </button>
+      </div>
+      <p className="hint">
+        {help}. Applies to {affected} of {units} unit{units === 1 ? "" : "s"} here
+        {withOverride > 0
+          ? `; ${withOverride} ${withOverride === 1 ? "has" : "have"} a CharaSet tier override and keep${
+              withOverride === 1 ? "s" : ""
+            } it`
+          : ""}
+        . Only empty gear slots change; items named in a CharaSet stay.
+        {bossPack && (value === 0 || value === 2)
+          ? " This squad has a unit with a BOSS tier override, so its other units get the POWER band even at NORMAL (the boss-pack rule). Give them a CharaSet override, or pick BOSS, to change that."
+          : ""}
+      </p>
+    </div>
+  );
+}
+
 function FormationGrid({
   squad,
   selectedSlot,
@@ -4163,6 +5162,11 @@ function UnitPanel({
   charaOverrideById,
   gearSkillHint,
   seatKinds,
+  charasetSharing,
+  baseParamset,
+  onChangeParamset,
+  squadSummary,
+  onRevertSquad,
   ifMap,
   skillMap,
   sharedPreset,
@@ -4194,6 +5198,14 @@ function UnitPanel({
   gearSkillHint: { complete: boolean; skillIds: Set<number> };
   /** default-gear color coding for each occupied seat of this squad */
   seatKinds: SeatKind[];
+  /** CharaSets shared by several seats (see charasetSharing in App) */
+  charasetSharing: Map<number, SharedSeat[]>;
+  /** the squad's PARAMSET in the unedited data */
+  baseParamset: number;
+  onChangeParamset: (value: number | null) => void;
+  /** what was edited in this squad (null = nothing to show) */
+  squadSummary: SquadEditSummary | null;
+  onRevertSquad: (opt: RevertOptions) => void;
   ifMap: Map<number, string>;
   skillMap: Map<number, { id: number; symbol?: string; name?: string }>;
   sharedPreset: boolean;
@@ -4406,6 +5418,19 @@ function UnitPanel({
     [local.equip_param, local.charaset_id, local.slot, squad, charaOverrideById]
   );
 
+  const equipTierInfo = useMemo(
+    () =>
+      seatTierInfo({
+        slot: local.slot,
+        charasetId: local.charaset_id,
+        seats: squad.slots,
+        exptype: squad.exptype,
+        paramset: squad.paramset,
+        overrideById: charaOverrideById,
+      }),
+    [local.slot, local.charaset_id, squad, charaOverrideById]
+  );
+
   const gearPreview = useMemo(
     () =>
       previewSeatGear(
@@ -4522,8 +5547,28 @@ function UnitPanel({
     ? createForUnit.key
     : String(local.equipaiset_id);
 
+  const squadSeats = squad.slots.filter((x) => x.charaset_id > 0);
+  const seatsWithOverride = squadSeats.filter(
+    (x) => (charaOverrideById.get(x.charaset_id) ?? x.chara_param_override ?? 0) > 0
+  ).length;
+
   return (
     <div>
+      <SquadRevertPanel
+        key={squad.unitset_id}
+        summary={squadSummary}
+        onRevert={onRevertSquad}
+      />
+      <SquadTierControl
+        value={squad.paramset ?? 0}
+        baseValue={baseParamset}
+        units={squadSeats.length}
+        withOverride={seatsWithOverride}
+        bossPack={squadSeats.some(
+          (x) => (charaOverrideById.get(x.charaset_id) ?? x.chara_param_override ?? 0) >= 4
+        )}
+        onChange={onChangeParamset}
+      />
       <FormationGrid
         squad={squad}
         seatKinds={seatKinds}
@@ -4685,6 +5730,55 @@ function UnitPanel({
           Restore default
         </button>
       </div>
+      <p className="hint">
+        Default-gear tier of this unit:{" "}
+        <strong>{TIER_NAMES[equipTierInfo.tier] ?? equipTierInfo.tier}</strong> (from{" "}
+        {equipTierInfo.source}). Change it in the squad box above or in the CharaSet gear
+        tab. It only affects empty slots.
+      </p>
+      {(() => {
+        // Gear is stored in the CharaSet, which other seats may share.
+        if (local.charaset_id < 2) return null;
+        const everyone = charasetSharing.get(local.charaset_id) ?? [];
+        const others = everyone.filter(
+          (r) => !(r.unitset_id === squad.unitset_id && r.slot === local.slot)
+        );
+        if (!others.length) return null;
+        const total = others.length + 1;
+        const stages = new Set(everyone.map((r) => r.stage)).size;
+        const where = others
+          .slice(0, 3)
+          .map((r) => r.label)
+          .join(", ");
+        const more = others.length > 3 ? ", …" : "";
+        const edited = local.gear.some((g) => g.edited);
+        return edited ? (
+          <div className="danger-box" role="alert">
+            <strong>⛔ Gear edits change {total} units, not just this one</strong>
+            <p>
+              CharaSet {local.charaset_id} ({local.charaset_symbol}) is used by {total}{" "}
+              units in {stages} mission{stages === 1 ? "" : "s"} (e.g. {where}
+              {more}). The game has no free CharaSet row to copy it into, so your
+              item change is written into the shared row and applies to every one of
+              them.
+            </p>
+            <p>
+              To change only this unit, swap it to a CharaSet that fewer seats use. To
+              change a whole tier, edit the Default gear tab instead.
+            </p>
+          </div>
+        ) : (
+          <div className="warn-box">
+            <strong>
+              ⚠ {total} units share CharaSet {local.charaset_id} ({local.charaset_symbol})
+            </strong>
+            <p>
+              Changing an item here changes it for all of them (e.g. {where}
+              {more}); the game has no free CharaSet row to copy it into.
+            </p>
+          </div>
+        );
+      })()}
       <div className="gear-grid">
         {local.gear.map((g, i) => (
           <label key={i}>

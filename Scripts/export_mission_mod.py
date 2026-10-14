@@ -93,6 +93,15 @@ def pchtxt_half(va: int, value: int) -> str:
     return f"{va:08X} {struct.pack('<H', value & 0xFFFF).hex().upper()}"
 
 
+def pchtxt_byte(va: int, value: int) -> str:
+    """One byte: tier values are 0-5 and little-endian keeps the low byte at the
+    field's address, so this is safe whether the game stores u8, u16 or u32."""
+    return f"{va:08X} {value & 0xFF:02X}"
+
+
+PARAMSET_NAMES = {0: "NONE", 1: "ZAKO", 2: "NORMAL", 3: "POWER", 4: "BOSS"}
+
+
 def reserved_charaset_ranges() -> list[tuple[int, int, int]]:
     """(charaset_id, start_va, end_va_exclusive) for engine-reserved rows."""
     ranges: list[tuple[int, int, int]] = []
@@ -645,6 +654,61 @@ def main() -> None:
             f"  - {describe_tactics_line(line, skill_labels, if_labels)}"
             for line in lines
         )
+
+    # Equip tier: per-squad PARAMSET (UnitSet +0x14) and per-CharaSet override (+0x1E).
+    base_para: dict[int, int] = {}
+    where: dict[int, str] = {}
+    for m in baseline.get("missions", []):
+        for sq in m.get("squads", []):
+            uid_ = int(sq.get("unitset_id") or 0)
+            base_para[uid_] = int(sq.get("paramset") or 0)
+            stage_ = str(m.get("stage_name") or m.get("quest_symbol") or "unknown mission")
+            sym_ = str(sq.get("unitset_symbol") or "").replace("UC_UNITSET_", "")
+            where[uid_] = f"{stage_} [{sym_}]" if sym_ else stage_
+    seen_uid: set[int] = set()
+    for e in edits.get("squad_paramsets") or []:
+        uid_ = int(e.get("unitset_id") or 0)
+        v = e.get("paramset")
+        if uid_ not in base_para:
+            notes.append(f"WARNING: PARAMSET edit skipped: UnitSet {uid_} is not in the mission data")
+            continue
+        if not isinstance(v, int) or not 0 <= v <= 4:
+            notes.append(f"WARNING: PARAMSET edit for UnitSet {uid_} skipped: {v} is not 0-4")
+            continue
+        if uid_ in seen_uid:
+            continue
+        seen_uid.add(uid_)
+        patches.append(f"// PARAMSET of UnitSet {uid_}")
+        patches.append(pchtxt_byte(UNITSET_BASE + uid_ * UNITSET_STRIDE + 0x14, v))
+        was = base_para.get(uid_, 0)
+        change = (
+            f"Set equip tier (PARAMSET) of {where.get(uid_, f'UnitSet {uid_}')} to "
+            f"{PARAMSET_NAMES[v]} (was {PARAMSET_NAMES.get(was, was)}); applies to every "
+            "unit there without a CharaSet tier override"
+        )
+        notes.append(change)
+        changes.append(change)
+    seen_cid: set[int] = set()
+    for e in edits.get("charaset_tier_overrides") or []:
+        cid_ = int(e.get("charaset_id") or 0)
+        v = e.get("override")
+        if cid_ < 2 or cid_ >= CHARASET_COUNT:
+            notes.append(f"WARNING: tier override skipped: CharaSet {cid_} is reserved or out of range")
+            continue
+        if not isinstance(v, int) or not 0 <= v <= 5:
+            notes.append(f"WARNING: tier override for CharaSet {cid_} skipped: {v} is not 0-5")
+            continue
+        if cid_ in seen_cid:
+            continue
+        seen_cid.add(cid_)
+        patches.append(f"// tier override of CharaSet {cid_}")
+        patches.append(pchtxt_byte(CHARASET_BASE + cid_ * CHARASET_STRIDE + 0x1E, v))
+        users = charaset_users.get(cid_, 0)
+        change = f"Set equip tier override of CharaSet {cid_} to {v}" + (
+            f"; it applies to all {users} units that use this CharaSet" if users > 1 else ""
+        )
+        notes.append(("NOTE: " + change) if users > 1 else change)
+        changes.append(change)
 
     # Explicit per-skill default conditions (shared by class slots and equipment).
     # Only the fields present in the edit are written.
